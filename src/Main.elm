@@ -33,7 +33,7 @@ type alias Model =
     { reserve : Reserve
     , transaction : Transaction
     , deposit : Deposit
-    , loan : Loan
+    , loan : List Loan
     }
 
 
@@ -78,7 +78,7 @@ init =
     { reserve = initialReserve
     , transaction = defaultLend
     , deposit = noDeposit
-    , loan = noLoan
+    , loan = []
     }
 
 
@@ -112,13 +112,6 @@ noDeposit : Deposit
 noDeposit =
     { deposit = 0
     , insurance = 0
-    }
-
-
-noLoan : Loan
-noLoan =
-    { loan = 0
-    , collateral = 0
     }
 
 
@@ -373,7 +366,7 @@ update msg model =
                                 reserve =
                                     { startReserve | token = newToken, collateral = newCollateral, interest = newInterest }
 
-                                loan : Loan
+                                loan : List Loan
                                 loan =
                                     addLoan (token + interest) collateral model.loan
 
@@ -481,18 +474,18 @@ addDeposit initialDeposit initialInsurance depositData =
     { depositData | deposit = deposit, insurance = insurance }
 
 
-addLoan : Float -> Float -> Loan -> Loan
+addLoan : Float -> Float -> List Loan -> List Loan
 addLoan initialLoan initialCollateral loanData =
     let
         loan : Float
         loan =
-            loanData.loan + initialLoan
+            initialLoan
 
         collateral : Float
         collateral =
-            loanData.collateral + initialCollateral
+            initialCollateral
     in
-    { loanData | loan = loan, collateral = collateral }
+    Loan loan collateral :: loanData
 
 
 
@@ -917,7 +910,21 @@ viewAsset deposit =
             , clipY
             , scrollbarX
             ]
-            [ viewDepositBox deposit ]
+            [ viewDepositTitle
+            , viewDepositBox deposit
+            ]
+
+
+viewDepositTitle : Element Msg
+viewDepositTitle =
+    el
+        [ width fill
+        , Font.color gray
+        , Font.size 24
+        , Font.family lato
+        , Font.center
+        ]
+        (text "Depost")
 
 
 viewDepositBox : Deposit -> Element Msg
@@ -968,9 +975,9 @@ viewDepositInsurance insurance =
 -- VIEW LIABILITY LIST
 
 
-viewLiability : Loan -> Element Msg
-viewLiability loan =
-    if loan == noLoan then
+viewLiability : List Loan -> Element Msg
+viewLiability listLoan =
+    if listLoan == [] then
         none
 
     else
@@ -985,7 +992,19 @@ viewLiability loan =
             , clipY
             , scrollbarX
             ]
-            [ viewLoanBox loan ]
+            (viewDebtTitle :: List.map viewLoanBox (List.reverse listLoan))
+
+
+viewDebtTitle : Element Msg
+viewDebtTitle =
+    el
+        [ width fill
+        , Font.color gray
+        , Font.size 24
+        , Font.family lato
+        , Font.center
+        ]
+        (text "Debt")
 
 
 viewLoanBox : Loan -> Element Msg
