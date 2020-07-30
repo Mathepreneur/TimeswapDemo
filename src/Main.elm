@@ -629,7 +629,7 @@ viewLendTab =
         , Font.center
         ]
         { onPress = Just SwitchToLend
-        , label = text "Pay"
+        , label = text "Lend"
         }
 
 
@@ -643,7 +643,7 @@ viewLendTabChosen =
         , Font.center
         ]
         { onPress = Just SwitchToLend
-        , label = text "Pay"
+        , label = text "Lend"
         }
 
 
@@ -657,7 +657,7 @@ viewBorrowTab =
         , Font.center
         ]
         { onPress = Just SwitchToBorrow
-        , label = text "Receive"
+        , label = text "Borrow"
         }
 
 
@@ -671,7 +671,7 @@ viewBorrowTabChosen =
         , Font.center
         ]
         { onPress = Just SwitchToBorrow
-        , label = text "Receive"
+        , label = text "Borrow"
         }
 
 
@@ -765,7 +765,7 @@ viewCollateralText =
         , Font.size 14
         , Font.family lato
         ]
-        (text "Collateral")
+        (text "Insurance")
 
 
 viewInterestText : Element Msg
