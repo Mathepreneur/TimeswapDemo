@@ -571,45 +571,64 @@ viewBody model =
 
 viewSwap : Model -> Element Msg
 viewSwap model =
-    column
-        [ width <| px 400
-        , padding 20
-        , spacing 20
-        , centerX
-        , alignTop
-        , Background.color dirtyWhite
-        , Border.rounded 30
-        ]
-        [ viewTabs model.transaction.state
-        , viewToken model.transaction.token
-        , viewCollateral model.transaction.collateral
-        , viewInterest model.transaction.interest
-        , viewSwapButton
-        ]
-
-
-viewTabs : State -> Element Msg
-viewTabs state =
-    case state of
+    case model.transaction.state of
         Lend ->
-            row
-                [ width fill
-                , padding 10
+            column
+                [ width <| px 400
+                , padding 20
+                , spacing 20
+                , centerX
+                , alignTop
                 , Background.color dirtyWhite
+                , Border.rounded 30
                 ]
-                [ viewLendTabChosen
-                , viewBorrowTab
+                [ viewLendTabs
+                , viewToken model.transaction.token
+                , viewInsurance model.transaction.token model.transaction.collateral model.reserve
+                , viewInterest model.transaction.token model.transaction.interest
+                , viewSwapButton
                 ]
 
         Borrow ->
-            row
-                [ width fill
-                , padding 10
+            column
+                [ width <| px 400
+                , padding 20
+                , spacing 20
+                , centerX
+                , alignTop
                 , Background.color dirtyWhite
+                , Border.rounded 30
                 ]
-                [ viewLendTab
-                , viewBorrowTabChosen
+                [ viewBorrowTabs
+                , viewToken model.transaction.token
+                , viewCollateral model.transaction.token model.transaction.collateral model.reserve
+                , viewInterest model.transaction.token model.transaction.interest
+                , viewSwapButton
                 ]
+
+
+viewLendTabs : Element Msg
+viewLendTabs =
+    row
+        [ width fill
+        , padding 10
+        , Background.color dirtyWhite
+        ]
+        [ viewLendTabChosen
+        , viewBorrowTab
+        ]
+
+
+viewBorrowTabs : Element Msg
+viewBorrowTabs =
+    row
+        [ width fill
+        , padding 10
+        , Background.color dirtyWhite
+        ]
+        [ viewLendTab
+        , viewBorrowTabChosen
+        ]
 
 
 viewLendTab : Element Msg
@@ -682,8 +701,8 @@ viewToken token =
         ]
 
 
-viewCollateral : String -> Element Msg
-viewCollateral collateral =
+viewInsurance : String -> String -> Reserve -> Element Msg
+viewInsurance token collateral reserve =
     column
         [ width fill
         , padding 20
@@ -691,13 +710,13 @@ viewCollateral collateral =
         , Background.color imperfectWhite
         , Border.rounded 30
         ]
-        [ viewInputCollateralDetails
+        [ viewInputInsuranceDetails <| getZMax token reserve
         , viewInput collateral "ETH" ChangeCollateralAmount
         ]
 
 
-viewInterest : String -> Element Msg
-viewInterest interest =
+viewCollateral : String -> String -> Reserve -> Element Msg
+viewCollateral token collateral reserve =
     column
         [ width fill
         , padding 20
@@ -705,35 +724,96 @@ viewInterest interest =
         , Background.color imperfectWhite
         , Border.rounded 30
         ]
-        [ viewInputInterestDetails
+        [ viewInputCollateralDetails <| getZMin token reserve
+        , viewInput collateral "ETH" ChangeCollateralAmount
+        ]
+
+
+getZMax : String -> Reserve -> Maybe String
+getZMax token reserve =
+    let
+        getMax : Float -> String
+        getMax float =
+            float * reserve.collateral / (reserve.token + float) |> roundDownMain |> String.fromFloat
+    in
+    String.toFloat token
+        |> Maybe.map getMax
+
+
+getZMin : String -> Reserve -> Maybe String
+getZMin token reserve =
+    let
+        getMin : Float -> String
+        getMin float =
+            float * reserve.collateral / (reserve.token - float) |> roundDownMain |> String.fromFloat
+    in
+    String.toFloat token
+        |> Maybe.map getMin
+
+
+viewInterest : String -> String -> Element Msg
+viewInterest token interest =
+    column
+        [ width fill
+        , padding 20
+        , spacing 10
+        , Background.color imperfectWhite
+        , Border.rounded 30
+        ]
+        [ viewInputInterestDetails <| getAPR token interest
         , viewInput interest "DAI" ChangeOutputAmount
         ]
 
 
+getAPR : String -> String -> Maybe String
+getAPR token interest =
+    let
+        maybeTokenFloat : Maybe Float
+        maybeTokenFloat =
+            String.toFloat token
+
+        maybeInterestFloat : Maybe Float
+        maybeInterestFloat =
+            String.toFloat interest
+
+        getInterest : Float -> Float -> String
+        getInterest tokenFloat interestFloat =
+            interestFloat * 100 / tokenFloat |> roundDownPercent |> String.fromFloat
+    in
+    Maybe.map2 getInterest maybeTokenFloat maybeInterestFloat
+
+
 viewInputTokenDetails : Element Msg
 viewInputTokenDetails =
+    el
+        [ width fill ]
+        viewPrincipalText
+
+
+viewInputInsuranceDetails : Maybe String -> Element Msg
+viewInputInsuranceDetails maybeLimit =
     row
         [ width fill ]
-        [ viewPrincipalText
-        , viewNow
+        [ viewInsuranceText
+        , viewMaximumInsurance maybeLimit
         ]
 
 
-viewInputCollateralDetails : Element Msg
-viewInputCollateralDetails =
+viewInputCollateralDetails : Maybe String -> Element Msg
+viewInputCollateralDetails maybeLimit =
     row
         [ width fill ]
         [ viewCollateralText
-        , viewNow
+        , viewMinimumCollateral maybeLimit
         ]
 
 
-viewInputInterestDetails : Element Msg
-viewInputInterestDetails =
+viewInputInterestDetails : Maybe String -> Element Msg
+viewInputInterestDetails maybePercent =
     row
         [ width fill ]
         [ viewInterestText
-        , viewLater
+        , viewPercent maybePercent
         ]
 
 
@@ -749,6 +829,18 @@ viewPrincipalText =
         (text "Principal")
 
 
+viewInsuranceText : Element Msg
+viewInsuranceText =
+    el
+        [ padding 5
+        , Border.rounded 30
+        , Font.color imperfectBlack
+        , Font.size 14
+        , Font.family lato
+        ]
+        (text "Insurance")
+
+
 viewCollateralText : Element Msg
 viewCollateralText =
     el
@@ -758,7 +850,7 @@ viewCollateralText =
         , Font.size 14
         , Font.family lato
         ]
-        (text "Insurance")
+        (text "Collateral")
 
 
 viewInterestText : Element Msg
@@ -770,7 +862,61 @@ viewInterestText =
         , Font.size 14
         , Font.family lato
         ]
-        (text "Interest")
+        (text "Interest on December 30, 2020")
+
+
+viewMaximumInsurance : Maybe String -> Element Msg
+viewMaximumInsurance maybeLimit =
+    case maybeLimit of
+        Just limit ->
+            el
+                [ alignRight
+                , padding 5
+                , Border.rounded 30
+                , Font.color imperfectBlack
+                , Font.size 14
+                , Font.family lato
+                ]
+                (text <| "Maximum " ++ limit)
+
+        Nothing ->
+            none
+
+
+viewMinimumCollateral : Maybe String -> Element Msg
+viewMinimumCollateral maybeLimit =
+    case maybeLimit of
+        Just limit ->
+            el
+                [ alignRight
+                , padding 5
+                , Border.rounded 30
+                , Font.color imperfectBlack
+                , Font.size 14
+                , Font.family lato
+                ]
+                (text <| "Minimum " ++ limit)
+
+        Nothing ->
+            none
+
+
+viewPercent : Maybe String -> Element Msg
+viewPercent maybePercent =
+    case maybePercent of
+        Just percent ->
+            el
+                [ alignRight
+                , padding 5
+                , Border.rounded 30
+                , Font.color imperfectBlack
+                , Font.size 14
+                , Font.family lato
+                ]
+                (text <| "APR " ++ percent ++ "%")
+
+        Nothing ->
+            none
 
 
 viewArrow : Element Msg
@@ -780,30 +926,6 @@ viewArrow =
         , height shrink
         ]
         Image.chevronDown
-
-
-viewNow : Element Msg
-viewNow =
-    el
-        [ padding 5
-        , Border.rounded 30
-        , Font.color imperfectBlack
-        , Font.size 14
-        , Font.family lato
-        ]
-        (text "Now")
-
-
-viewLater : Element Msg
-viewLater =
-    el
-        [ padding 5
-        , Border.rounded 30
-        , Font.color imperfectBlack
-        , Font.size 14
-        , Font.family lato
-        ]
-        (text "on December 30, 2020")
 
 
 viewInput : String -> String -> (String -> Msg) -> Element Msg
@@ -1049,6 +1171,21 @@ viewLoanCollateral collateral =
         [ text <| String.fromFloat collateral
         , el [ alignRight ] <| text "ETH"
         ]
+
+
+roundDownMain : Float -> Float
+roundDownMain =
+    roundDown 6
+
+
+roundDownPercent : Float -> Float
+roundDownPercent =
+    roundDown 2
+
+
+roundDown : Int -> Float -> Float
+roundDown decimals float =
+    (float * toFloat (10 ^ decimals) |> truncate |> toFloat) / toFloat (10 ^ decimals)
 
 
 
