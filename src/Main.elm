@@ -1046,7 +1046,7 @@ viewDepositTitle =
         , Font.family lato
         , Font.center
         ]
-        (text "Depost")
+        (text "Deposit")
 
 
 viewDepositBox : Deposit -> Element Msg
