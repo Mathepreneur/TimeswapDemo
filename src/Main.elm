@@ -1,26 +1,36 @@
-module Main exposing (main)
+port module Main exposing (idDecoder, main)
 
 -- IMPORT
 
 import Browser
-import Element exposing (..)
+import Browser.Events
+import Data exposing (Address, Deposit, Loan, Reserve, UnsignedInteger)
+import Dict exposing (Dict)
+import Element exposing (Color, Element, FocusStyle)
 import Element.Background as Background
 import Element.Border as Border
 import Element.Font as Font exposing (Font)
 import Element.Input as Input exposing (Placeholder)
 import Html exposing (Html)
 import Image
+import Json.Decode as Decode exposing (Decoder)
+import Json.Decode.Pipeline as Pipeline
+import Json.Encode as Encode exposing (Value)
+import Network exposing (Network)
+import Sort.Dict
+import Time exposing (Posix)
 
 
 
 -- MAIN
 
 
-main : Program () Model Msg
+main : Program Flag Model Msg
 main =
-    Browser.sandbox
+    Browser.element
         { init = init
         , update = update
+        , subscriptions = subscriptions
         , view = view
         }
 
@@ -30,88 +40,109 @@ main =
 
 
 type alias Model =
-    { reserve : Reserve
+    { window : Window
+    , state : State
+    , error : Maybe String
+    }
+
+
+type alias Window =
+    { width : Int
+    , height : Int
+    }
+
+
+type State
+    = Rinkeby Info
+    | NotConnected
+    | NoMetamask
+
+
+type alias Info =
+    { user : Address
+    , tokenApproved : Maybe Approved
+    , collateralApproved : Maybe Approved
+    , reserve : Maybe Reserve
     , transaction : Transaction
-    , deposit : Deposit
-    , loan : List Loan
+    , deposit : Maybe Deposit
+    , loan : Sort.Dict.Dict UnsignedInteger Loan
+    , log : Log
     }
 
 
-type alias Reserve =
-    { token : Float
-    , interest : Float
-    , collateral : Float
-    }
+type Approved
+    = Approved
+    | NotApproved
 
 
 type alias Transaction =
-    { state : State
+    { transactionType : TransactionType
     , token : String
     , collateral : String
     , interest : String
     }
 
 
-type State
+type TransactionType
     = Lend
     | Borrow
 
 
-type alias Deposit =
-    { deposit : Float
-    , insurance : Float
+type alias Log =
+    { id : Int
+    , record : Record
     }
 
 
-type alias Loan =
-    { loan : Float
-    , collateral : Float
+type alias Record =
+    Dict Int Function
+
+
+type Function
+    = ViewReserves
+    | DepositOf
+    | LoanOf UnsignedInteger
+    | AllowanceToken
+    | AllowanceCollateral
+    | ApproveToken
+    | ApproveCollateral
+    | Lending
+    | Borrowing
+
+
+type alias Outcome =
+    { value : Value
+    , log : Log
     }
+
+
+type Method
+    = Call
+    | SendTransaction
 
 
 
 -- INIT
 
 
-init : Model
-init =
-    { reserve = initialReserve
-    , transaction = defaultLend
-    , deposit = noDeposit
-    , loan = []
-    }
+init : Flag -> ( Model, Cmd Msg )
+init { width, height, hasMetamask } =
+    let
+        state : State
+        state =
+            if hasMetamask then
+                NotConnected
+
+            else
+                NoMetamask
+    in
+    ( Model (Window width height) state Nothing, Cmd.none )
 
 
-initialReserve : Reserve
-initialReserve =
-    { token = 100000
-    , interest = 20000
-    , collateral = 400
-    }
-
-
-defaultLend : Transaction
-defaultLend =
-    { state = Lend
-    , token = ""
-    , collateral = ""
-    , interest = ""
-    }
-
-
-defaultBorrow : Transaction
-defaultBorrow =
-    { state = Borrow
-    , token = ""
-    , collateral = ""
-    , interest = ""
-    }
-
-
-noDeposit : Deposit
-noDeposit =
-    { deposit = 0
-    , insurance = 0
+type alias Flag =
+    { width : Int
+    , height : Int
+    , hasMetamask : Bool
     }
 
 
@@ -120,11 +151,19 @@ noDeposit =
 
 
 type Msg
-    = SwitchToLend
+    = ChangeWindow Int Int
+    | SendConnect
+    | ReceiveConnect Value
+    | ReceiveUser Value
+    | ReceiveNetwork Value
+    | ReceiveTransaction Value
+    | Check Posix
+    | SwitchToLend
     | SwitchToBorrow
-    | ChangeInputAmount String
-    | ChangeOutputAmount String
+    | ChangeTokenAmount String
     | ChangeCollateralAmount String
+    | ChangeInterestAmount String
+    | Approve
     | Swap
 
 
@@ -132,360 +171,1352 @@ type Msg
 -- UPDATE
 
 
-update : Msg -> Model -> Model
+update : Msg -> Model -> ( Model, Cmd Msg )
 update msg model =
-    case msg of
-        SwitchToLend ->
-            { model | transaction = defaultLend }
+    case ( msg, model.state ) of
+        ( ChangeWindow width height, _ ) ->
+            ( { model | window = Window width height }, Cmd.none )
 
-        SwitchToBorrow ->
-            { model | transaction = defaultBorrow }
+        ( SendConnect, NotConnected ) ->
+            ( model, sendConnect () )
 
-        ChangeInputAmount input ->
+        ( ReceiveConnect value, NotConnected ) ->
+            updateConnect value model
+
+        ( ReceiveUser value, Rinkeby _ ) ->
+            updateUser value model
+
+        ( ReceiveNetwork value, Rinkeby info ) ->
+            updateNetwork value info model
+
+        ( ReceiveTransaction value, Rinkeby info ) ->
+            updateTransaction value info model
+
+        ( Check _, Rinkeby info ) ->
+            updateCheck info model
+
+        ( SwitchToLend, Rinkeby info ) ->
+            updateToLend info model
+
+        ( SwitchToBorrow, Rinkeby info ) ->
+            updateToBorrow info model
+
+        ( ChangeTokenAmount input, Rinkeby info ) ->
+            updateTokenAmount input info model
+
+        ( ChangeCollateralAmount input, Rinkeby info ) ->
+            updateCollateralAmount input info model
+
+        ( ChangeInterestAmount input, Rinkeby info ) ->
+            updateInterestAmount input info model
+
+        ( Approve, Rinkeby info ) ->
+            updateApprove info model
+
+        ( Swap, Rinkeby info ) ->
+            updateSwap info model
+
+        _ ->
+            ( model, Cmd.none )
+
+
+updateConnect : Value -> Model -> ( Model, Cmd Msg )
+updateConnect value model =
+    let
+        resultConnect : Result Decode.Error ResultConnect
+        resultConnect =
+            Decode.decodeValue decoderConnect value
+    in
+    case resultConnect of
+        Ok { network, user } ->
+            case ( network, user ) of
+                ( Ok _, Ok address ) ->
+                    let
+                        viewReservesOutcome : Outcome
+                        viewReservesOutcome =
+                            viewReserves
+                                { id = 0
+                                , record = Dict.empty
+                                }
+
+                        depositOfOutcome : Outcome
+                        depositOfOutcome =
+                            depositOf address viewReservesOutcome.log
+
+                        loanOfOutcome : Outcome
+                        loanOfOutcome =
+                            loanOf address Data.unsignedIntegerZero depositOfOutcome.log
+
+                        allowanceTokenOutcome : Outcome
+                        allowanceTokenOutcome =
+                            allowanceToken address loanOfOutcome.log
+
+                        allowanceCollateralOutcome : Outcome
+                        allowanceCollateralOutcome =
+                            allowanceCollateral address allowanceTokenOutcome.log
+
+                        sendTransactionCommand : Cmd Msg
+                        sendTransactionCommand =
+                            Cmd.batch
+                                [ sendTransaction viewReservesOutcome.value
+                                , sendTransaction depositOfOutcome.value
+                                , sendTransaction loanOfOutcome.value
+                                , sendTransaction allowanceTokenOutcome.value
+                                , sendTransaction allowanceCollateralOutcome.value
+                                ]
+
+                        state : State
+                        state =
+                            initialState address allowanceCollateralOutcome.log
+                    in
+                    ( { model | state = state }, sendTransactionCommand )
+
+                ( Err error, _ ) ->
+                    ( { model | error = Just error }, Cmd.none )
+
+                ( _, Err error ) ->
+                    ( { model | error = Just error }, Cmd.none )
+
+        Err decodeError ->
+            ( { model | error = Just <| Decode.errorToString decodeError }
+            , Cmd.none
+            )
+
+
+initialState : Address -> Log -> State
+initialState address log =
+    Rinkeby
+        { user = address
+        , tokenApproved = Nothing
+        , collateralApproved = Nothing
+        , reserve = Nothing
+        , transaction = defaultLend
+        , deposit = Nothing
+        , loan = Sort.Dict.empty Data.sorter
+        , log = log
+        }
+
+
+defaultLend : Transaction
+defaultLend =
+    { transactionType = Lend
+    , token = ""
+    , collateral = ""
+    , interest = ""
+    }
+
+
+defaultBorrow : Transaction
+defaultBorrow =
+    { transactionType = Borrow
+    , token = ""
+    , collateral = ""
+    , interest = ""
+    }
+
+
+type alias ResultConnect =
+    { network : Result String Network
+    , user : Result String Address
+    }
+
+
+decoderConnect : Decoder ResultConnect
+decoderConnect =
+    Decode.succeed ResultConnect
+        |> Pipeline.required "network" Network.decoder
+        |> Pipeline.required "user" Data.addressDecoder
+
+
+updateUser : Value -> Model -> ( Model, Cmd Msg )
+updateUser value model =
+    let
+        resultAddress : Result Decode.Error (Maybe (Result String Address))
+        resultAddress =
+            Decode.decodeValue (Decode.nullable Data.addressDecoder) value
+    in
+    case resultAddress of
+        Ok (Just (Ok address)) ->
             let
-                initialTransaction : Transaction
-                initialTransaction =
-                    model.transaction
+                viewReservesOutcome : Outcome
+                viewReservesOutcome =
+                    viewReserves
+                        { id = 0
+                        , record = Dict.empty
+                        }
 
-                maybeToken : Maybe Float
-                maybeToken =
-                    String.toFloat input
+                depositOfOutcome : Outcome
+                depositOfOutcome =
+                    depositOf address viewReservesOutcome.log
 
-                maybeCollateral : Maybe Float
-                maybeCollateral =
-                    String.toFloat model.transaction.collateral
+                loanOfOutcome : Outcome
+                loanOfOutcome =
+                    loanOf address Data.unsignedIntegerZero depositOfOutcome.log
+
+                allowanceTokenOutcome : Outcome
+                allowanceTokenOutcome =
+                    allowanceToken address loanOfOutcome.log
+
+                allowanceCollateralOutcome : Outcome
+                allowanceCollateralOutcome =
+                    allowanceCollateral address allowanceTokenOutcome.log
+
+                sendTransactionCommand : Cmd Msg
+                sendTransactionCommand =
+                    Cmd.batch
+                        [ sendTransaction viewReservesOutcome.value
+                        , sendTransaction depositOfOutcome.value
+                        , sendTransaction loanOfOutcome.value
+                        , sendTransaction allowanceTokenOutcome.value
+                        , sendTransaction allowanceCollateralOutcome.value
+                        ]
+
+                state : State
+                state =
+                    initialState address allowanceCollateralOutcome.log
             in
-            case ( initialTransaction.state, maybeToken, maybeCollateral ) of
-                ( Lend, Just token, Just collateral ) ->
-                    let
-                        transaction : Transaction
-                        transaction =
-                            { initialTransaction | token = input, interest = getInterestLend token collateral model.reserve }
-                    in
-                    { model | transaction = transaction }
+            ( { model | state = state }
+            , sendTransactionCommand
+            )
 
-                ( Borrow, Just token, Just collateral ) ->
+        Ok (Just (Err error)) ->
+            ( { model | state = NotConnected, error = Just error }
+            , Cmd.none
+            )
+
+        Ok Nothing ->
+            ( { model | state = NotConnected, error = Just "You have been logged out. Decentralized Counter only works with Kovan Test Network. Please switch your network on Metamask." }
+            , Cmd.none
+            )
+
+        Err decodeError ->
+            ( { model | error = Just <| Decode.errorToString decodeError }
+            , Cmd.none
+            )
+
+
+updateNetwork : Value -> Info -> Model -> ( Model, Cmd Msg )
+updateNetwork value info model =
+    let
+        resultNetwork : Result Decode.Error (Result String Network)
+        resultNetwork =
+            Decode.decodeValue Network.decoder value
+    in
+    case resultNetwork of
+        Ok (Ok _) ->
+            let
+                viewReservesOutcome : Outcome
+                viewReservesOutcome =
+                    viewReserves
+                        { id = 0
+                        , record = Dict.empty
+                        }
+
+                depositOfOutcome : Outcome
+                depositOfOutcome =
+                    depositOf info.user viewReservesOutcome.log
+
+                loanOfOutcome : Outcome
+                loanOfOutcome =
+                    loanOf info.user Data.unsignedIntegerZero depositOfOutcome.log
+
+                allowanceTokenOutcome : Outcome
+                allowanceTokenOutcome =
+                    allowanceToken info.user loanOfOutcome.log
+
+                allowanceCollateralOutcome : Outcome
+                allowanceCollateralOutcome =
+                    allowanceCollateral info.user allowanceTokenOutcome.log
+
+                sendTransactionCommand : Cmd Msg
+                sendTransactionCommand =
+                    Cmd.batch
+                        [ sendTransaction viewReservesOutcome.value
+                        , sendTransaction depositOfOutcome.value
+                        , sendTransaction loanOfOutcome.value
+                        , sendTransaction allowanceTokenOutcome.value
+                        , sendTransaction allowanceCollateralOutcome.value
+                        ]
+
+                state : State
+                state =
+                    initialState info.user allowanceCollateralOutcome.log
+            in
+            ( { model | state = state }
+            , sendTransactionCommand
+            )
+
+        Ok (Err error) ->
+            ( { model | state = NotConnected, error = Just error }
+            , Cmd.none
+            )
+
+        Err decodeError ->
+            ( { model | error = Just <| Decode.errorToString decodeError }
+            , Cmd.none
+            )
+
+
+updateTransaction : Value -> Info -> Model -> ( Model, Cmd Msg )
+updateTransaction value info model =
+    let
+        id : Result Decode.Error Int
+        id =
+            value
+                |> Decode.decodeValue idDecoder
+
+        function : Result Decode.Error (Maybe Function)
+        function =
+            info.log.record
+                |> Ok
+                |> Result.map2 Dict.get id
+
+        jsonrpc : Result Decode.Error String
+        jsonrpc =
+            value
+                |> Decode.decodeValue jsonrpcDecoder
+    in
+    case ( jsonrpc, function ) of
+        ( Ok "2.0", Ok (Just ViewReserves) ) ->
+            let
+                reserve : Maybe Reserve
+                reserve =
+                    value
+                        |> Decode.decodeValue viewReservesDecoder
+                        |> Result.map Result.toMaybe
+                        |> Result.withDefault Nothing
+
+                nextInfo : Info
+                nextInfo =
+                    { info | reserve = reserve }
+            in
+            ( { model | state = Rinkeby nextInfo }, Cmd.none )
+
+        ( Ok "2.0", Ok (Just DepositOf) ) ->
+            let
+                deposit : Maybe Deposit
+                deposit =
+                    value
+                        |> Decode.decodeValue depositOfDecoder
+                        |> Result.map Result.toMaybe
+                        |> Result.withDefault Nothing
+
+                nextInfo : Info
+                nextInfo =
+                    { info | deposit = deposit }
+            in
+            ( { model | state = Rinkeby nextInfo }, Cmd.none )
+
+        ( Ok "2.0", Ok (Just (LoanOf index)) ) ->
+            let
+                resultLoan : Maybe Loan
+                resultLoan =
+                    value
+                        |> Decode.decodeValue loanOfDecoder
+                        |> Result.map Result.toMaybe
+                        |> Result.withDefault Nothing
+            in
+            case resultLoan of
+                Just loan ->
+                    let
+                        nextIndex : UnsignedInteger
+                        nextIndex =
+                            Result.withDefault Data.unsignedIntegerZero <| Data.increment index
+
+                        loanOfOutcome : Outcome
+                        loanOfOutcome =
+                            loanOf info.user nextIndex info.log
+
+                        nextInfo : Info
+                        nextInfo =
+                            { info | loan = Sort.Dict.insert index loan info.loan, log = loanOfOutcome.log }
+                    in
+                    ( { model | state = Rinkeby nextInfo }
+                    , sendTransaction loanOfOutcome.value
+                    )
+
+                Nothing ->
+                    ( model, Cmd.none )
+
+        ( Ok "2.0", Ok (Just AllowanceToken) ) ->
+            let
+                resultUnsignedInteger : Maybe UnsignedInteger
+                resultUnsignedInteger =
+                    value
+                        |> Decode.decodeValue unsignedIntegerDecoder
+                        |> Result.map Result.toMaybe
+                        |> Result.withDefault Nothing
+            in
+            case resultUnsignedInteger of
+                Just unsignedInteger ->
+                    let
+                        tokenApproved : Approved
+                        tokenApproved =
+                            if unsignedInteger == Data.unsignedIntegerMaxInteger then
+                                Approved
+
+                            else
+                                NotApproved
+
+                        nextInfo : Info
+                        nextInfo =
+                            { info | tokenApproved = Just tokenApproved }
+                    in
+                    ( { model | state = Rinkeby nextInfo }, Cmd.none )
+
+                Nothing ->
+                    let
+                        nextInfo : Info
+                        nextInfo =
+                            { info | tokenApproved = Nothing }
+                    in
+                    ( { model | state = Rinkeby nextInfo }, Cmd.none )
+
+        ( Ok "2.0", Ok (Just AllowanceCollateral) ) ->
+            let
+                resultUnsignedInteger : Maybe UnsignedInteger
+                resultUnsignedInteger =
+                    value
+                        |> Decode.decodeValue unsignedIntegerDecoder
+                        |> Result.map Result.toMaybe
+                        |> Result.withDefault Nothing
+            in
+            case resultUnsignedInteger of
+                Just unsignedInteger ->
+                    let
+                        collateralApproved : Approved
+                        collateralApproved =
+                            if unsignedInteger == Data.unsignedIntegerMaxInteger then
+                                Approved
+
+                            else
+                                NotApproved
+
+                        nextInfo : Info
+                        nextInfo =
+                            { info | collateralApproved = Just collateralApproved }
+                    in
+                    ( { model | state = Rinkeby nextInfo }, Cmd.none )
+
+                Nothing ->
+                    let
+                        nextInfo : Info
+                        nextInfo =
+                            { info | collateralApproved = Nothing }
+                    in
+                    ( { model | state = Rinkeby nextInfo }, Cmd.none )
+
+        _ ->
+            ( model, Cmd.none )
+
+
+idDecoder : Decoder Int
+idDecoder =
+    Decode.field "id" Decode.int
+
+
+jsonrpcDecoder : Decoder String
+jsonrpcDecoder =
+    Decode.field "jsonrpc" Decode.string
+
+
+viewReservesDecoder : Decoder (Result String Reserve)
+viewReservesDecoder =
+    Decode.field "result" Data.viewReservesDecoder
+
+
+depositOfDecoder : Decoder (Result String Deposit)
+depositOfDecoder =
+    Decode.field "result" Data.depositOfDecoder
+
+
+loanOfDecoder : Decoder (Result String Loan)
+loanOfDecoder =
+    Decode.field "result" Data.loanOfDecoder
+
+
+unsignedIntegerDecoder : Decoder (Result String UnsignedInteger)
+unsignedIntegerDecoder =
+    Decode.field "result" Data.unsignedIntegerDecoder
+
+
+updateCheck : Info -> Model -> ( Model, Cmd Msg )
+updateCheck info model =
+    let
+        viewReservesOutcome : Outcome
+        viewReservesOutcome =
+            viewReserves info.log
+
+        depositOfOutcome : Outcome
+        depositOfOutcome =
+            depositOf info.user viewReservesOutcome.log
+
+        loanOfOutcome : Outcome
+        loanOfOutcome =
+            loanOf info.user Data.unsignedIntegerZero depositOfOutcome.log
+
+        allowanceTokenOutcome : Outcome
+        allowanceTokenOutcome =
+            allowanceToken info.user loanOfOutcome.log
+
+        allowanceCollateralOutcome : Outcome
+        allowanceCollateralOutcome =
+            allowanceCollateral info.user allowanceTokenOutcome.log
+
+        sendTransactionCommand : Cmd Msg
+        sendTransactionCommand =
+            Cmd.batch
+                [ sendTransaction viewReservesOutcome.value
+                , sendTransaction depositOfOutcome.value
+                , sendTransaction loanOfOutcome.value
+                , sendTransaction allowanceTokenOutcome.value
+                , sendTransaction allowanceCollateralOutcome.value
+                ]
+
+        nextInfo : Info
+        nextInfo =
+            { info | log = allowanceCollateralOutcome.log }
+    in
+    ( { model | state = Rinkeby nextInfo }
+    , sendTransactionCommand
+    )
+
+
+updateToLend : Info -> Model -> ( Model, Cmd Msg )
+updateToLend info model =
+    let
+        nextInfo : Info
+        nextInfo =
+            { info | transaction = defaultLend }
+    in
+    ( { model | state = Rinkeby nextInfo }, Cmd.none )
+
+
+updateToBorrow : Info -> Model -> ( Model, Cmd Msg )
+updateToBorrow info model =
+    let
+        nextInfo : Info
+        nextInfo =
+            { info | transaction = defaultBorrow }
+    in
+    ( { model | state = Rinkeby nextInfo }, Cmd.none )
+
+
+updateTokenAmount : String -> Info -> Model -> ( Model, Cmd Msg )
+updateTokenAmount input info model =
+    let
+        initialTransaction : Transaction
+        initialTransaction =
+            info.transaction
+
+        resultToken : Result String UnsignedInteger
+        resultToken =
+            Data.toUnsignedIntegerFromStringToken input
+
+        resultCollateral : Result String UnsignedInteger
+        resultCollateral =
+            Data.toUnsignedIntegerFromStringToken initialTransaction.collateral
+    in
+    case info.reserve of
+        Just reserve ->
+            case ( initialTransaction.transactionType, resultToken, resultCollateral ) of
+                ( Lend, Ok token, Ok collateral ) ->
                     let
                         transaction : Transaction
                         transaction =
-                            { initialTransaction | token = input, interest = getInterestBorrow token collateral model.reserve }
+                            { initialTransaction | token = input, interest = getInterestLend token collateral reserve }
+
+                        nextInfo : Info
+                        nextInfo =
+                            { info | transaction = transaction }
                     in
-                    { model | transaction = transaction }
+                    ( { model | state = Rinkeby nextInfo }, Cmd.none )
+
+                ( Borrow, Ok token, Ok collateral ) ->
+                    let
+                        transaction : Transaction
+                        transaction =
+                            { initialTransaction | token = input, interest = getInterestBorrow token collateral reserve }
+
+                        nextInfo : Info
+                        nextInfo =
+                            { info | transaction = transaction }
+                    in
+                    ( { model | state = Rinkeby nextInfo }, Cmd.none )
 
                 _ ->
                     let
                         transaction : Transaction
                         transaction =
                             { initialTransaction | token = input }
+
+                        nextInfo : Info
+                        nextInfo =
+                            { info | transaction = transaction }
                     in
-                    { model | transaction = transaction }
+                    ( { model | state = Rinkeby nextInfo }, Cmd.none )
 
-        ChangeOutputAmount output ->
-            let
-                initialTransaction : Transaction
-                initialTransaction =
-                    model.transaction
+        Nothing ->
+            ( model, Cmd.none )
 
-                maybeCollateral : Maybe Float
-                maybeCollateral =
-                    String.toFloat model.transaction.collateral
 
-                maybeInterest : Maybe Float
-                maybeInterest =
-                    String.toFloat output
-            in
-            case ( initialTransaction.state, maybeCollateral, maybeInterest ) of
-                ( Lend, Just collateral, Just interest ) ->
+updateCollateralAmount : String -> Info -> Model -> ( Model, Cmd Msg )
+updateCollateralAmount input info model =
+    let
+        initialTransaction : Transaction
+        initialTransaction =
+            info.transaction
+
+        resultToken : Result String UnsignedInteger
+        resultToken =
+            Data.toUnsignedIntegerFromStringToken initialTransaction.token
+
+        resultCollateral : Result String UnsignedInteger
+        resultCollateral =
+            Data.toUnsignedIntegerFromStringToken input
+    in
+    case info.reserve of
+        Just reserve ->
+            case ( initialTransaction.transactionType, resultToken, resultCollateral ) of
+                ( Lend, Ok token, Ok collateral ) ->
                     let
                         transaction : Transaction
                         transaction =
-                            { initialTransaction | interest = output, token = getTokenLend collateral interest model.reserve }
-                    in
-                    { model | transaction = transaction }
+                            { initialTransaction | collateral = input, interest = getInterestLend token collateral reserve }
 
-                ( Borrow, Just collateral, Just interest ) ->
+                        nextInfo : Info
+                        nextInfo =
+                            { info | transaction = transaction }
+                    in
+                    ( { model | state = Rinkeby nextInfo }, Cmd.none )
+
+                ( Borrow, Ok token, Ok collateral ) ->
                     let
                         transaction : Transaction
                         transaction =
-                            { initialTransaction | interest = output, token = getTokenBorrow collateral interest model.reserve }
+                            { initialTransaction | collateral = input, interest = getInterestBorrow token collateral reserve }
+
+                        nextInfo : Info
+                        nextInfo =
+                            { info | transaction = transaction }
                     in
-                    { model | transaction = transaction }
+                    ( { model | state = Rinkeby nextInfo }, Cmd.none )
 
                 _ ->
                     let
                         transaction : Transaction
                         transaction =
-                            { initialTransaction | interest = output }
+                            { initialTransaction | collateral = input }
+
+                        nextInfo : Info
+                        nextInfo =
+                            { info | transaction = transaction }
                     in
-                    { model | transaction = transaction }
+                    ( { model | state = Rinkeby nextInfo }, Cmd.none )
 
-        ChangeCollateralAmount col ->
+        Nothing ->
+            ( model, Cmd.none )
+
+
+updateInterestAmount : String -> Info -> Model -> ( Model, Cmd Msg )
+updateInterestAmount input info model =
+    let
+        initialTransaction : Transaction
+        initialTransaction =
+            info.transaction
+
+        resultCollateral : Result String UnsignedInteger
+        resultCollateral =
+            Data.toUnsignedIntegerFromStringToken initialTransaction.collateral
+
+        resultInterest : Result String UnsignedInteger
+        resultInterest =
+            Data.toUnsignedIntegerFromStringToken input
+    in
+    case info.reserve of
+        Just reserve ->
+            case ( initialTransaction.transactionType, resultCollateral, resultInterest ) of
+                ( Lend, Ok collateral, Ok interest ) ->
+                    let
+                        transaction : Transaction
+                        transaction =
+                            { initialTransaction | token = getTokenLend collateral interest reserve, interest = input }
+
+                        nextInfo : Info
+                        nextInfo =
+                            { info | transaction = transaction }
+                    in
+                    ( { model | state = Rinkeby nextInfo }, Cmd.none )
+
+                ( Borrow, Ok collateral, Ok interest ) ->
+                    let
+                        transaction : Transaction
+                        transaction =
+                            { initialTransaction | token = getTokenBorrow collateral interest reserve, interest = input }
+
+                        nextInfo : Info
+                        nextInfo =
+                            { info | transaction = transaction }
+                    in
+                    ( { model | state = Rinkeby nextInfo }, Cmd.none )
+
+                _ ->
+                    let
+                        transaction : Transaction
+                        transaction =
+                            { initialTransaction | interest = input }
+
+                        nextInfo : Info
+                        nextInfo =
+                            { info | transaction = transaction }
+                    in
+                    ( { model | state = Rinkeby nextInfo }, Cmd.none )
+
+        Nothing ->
+            ( model, Cmd.none )
+
+
+updateApprove : Info -> Model -> ( Model, Cmd Msg )
+updateApprove info model =
+    case ( info.transaction.transactionType, info.tokenApproved, info.collateralApproved ) of
+        ( Lend, Just NotApproved, _ ) ->
             let
-                initialTransaction : Transaction
-                initialTransaction =
-                    model.transaction
+                approveOutcome : Outcome
+                approveOutcome =
+                    approveToken info.user info.log
 
-                maybeToken : Maybe Float
-                maybeToken =
-                    String.toFloat model.transaction.token
-
-                maybeCollateral : Maybe Float
-                maybeCollateral =
-                    String.toFloat col
-
-                maybeInterest : Maybe Float
-                maybeInterest =
-                    String.toFloat model.transaction.interest
+                nextInfo : Info
+                nextInfo =
+                    { info | log = approveOutcome.log }
             in
-            case initialTransaction.state of
+            ( { model | state = Rinkeby nextInfo }, sendTransaction approveOutcome.value )
+
+        ( Borrow, _, Just NotApproved ) ->
+            let
+                approveOutcome : Outcome
+                approveOutcome =
+                    approveCollateral info.user info.log
+
+                nextInfo : Info
+                nextInfo =
+                    { info | log = approveOutcome.log }
+            in
+            ( { model | state = Rinkeby nextInfo }, sendTransaction approveOutcome.value )
+
+        _ ->
+            ( model, Cmd.none )
+
+
+updateSwap : Info -> Model -> ( Model, Cmd Msg )
+updateSwap info model =
+    let
+        initialTransaction : Transaction
+        initialTransaction =
+            info.transaction
+
+        resultToken : Result String UnsignedInteger
+        resultToken =
+            Data.toUnsignedIntegerFromStringToken initialTransaction.token
+
+        resultCollateral : Result String UnsignedInteger
+        resultCollateral =
+            Data.toUnsignedIntegerFromStringToken initialTransaction.collateral
+
+        resultInterest : Result String UnsignedInteger
+        resultInterest =
+            Data.toUnsignedIntegerFromStringToken initialTransaction.interest
+    in
+    case ( resultToken, resultCollateral, resultInterest ) of
+        ( Ok token, Ok collateral, Ok _ ) ->
+            case initialTransaction.transactionType of
                 Lend ->
-                    case ( maybeToken, maybeCollateral, maybeInterest ) of
-                        ( Just token, Just collateral, _ ) ->
-                            let
-                                transaction : Transaction
-                                transaction =
-                                    { initialTransaction | collateral = col, interest = getInterestLend token collateral model.reserve }
-                            in
-                            { model | transaction = transaction }
+                    let
+                        lendOutcome : Outcome
+                        lendOutcome =
+                            lend token collateral info.user info.log
 
-                        ( Nothing, Just collateral, Just interest ) ->
-                            let
-                                transaction : Transaction
-                                transaction =
-                                    { initialTransaction | collateral = col, interest = getTokenLend collateral interest model.reserve }
-                            in
-                            { model | transaction = transaction }
-
-                        _ ->
-                            let
-                                transaction : Transaction
-                                transaction =
-                                    { initialTransaction | collateral = col }
-                            in
-                            { model | transaction = transaction }
+                        nextInfo : Info
+                        nextInfo =
+                            { info | log = lendOutcome.log, transaction = defaultLend }
+                    in
+                    ( { model | state = Rinkeby nextInfo }, sendTransaction lendOutcome.value )
 
                 Borrow ->
-                    case ( maybeToken, maybeCollateral, maybeInterest ) of
-                        ( Just token, Just collateral, _ ) ->
-                            let
-                                transaction : Transaction
-                                transaction =
-                                    { initialTransaction | collateral = col, interest = getInterestBorrow token collateral model.reserve }
-                            in
-                            { model | transaction = transaction }
+                    let
+                        borrowOutcome : Outcome
+                        borrowOutcome =
+                            borrow token collateral info.user info.log
 
-                        ( Nothing, Just collateral, Just interest ) ->
-                            let
-                                transaction : Transaction
-                                transaction =
-                                    { initialTransaction | collateral = col, interest = getTokenBorrow collateral interest model.reserve }
-                            in
-                            { model | transaction = transaction }
+                        nextInfo : Info
+                        nextInfo =
+                            { info | log = borrowOutcome.log, transaction = defaultBorrow }
+                    in
+                    ( { model | state = Rinkeby nextInfo }, sendTransaction borrowOutcome.value )
 
-                        _ ->
-                            let
-                                transaction : Transaction
-                                transaction =
-                                    { initialTransaction | collateral = col }
-                            in
-                            { model | transaction = transaction }
-
-        Swap ->
-            let
-                initialTransaction : Transaction
-                initialTransaction =
-                    model.transaction
-
-                maybeToken : Maybe Float
-                maybeToken =
-                    String.toFloat model.transaction.token
-
-                maybeCollateral : Maybe Float
-                maybeCollateral =
-                    String.toFloat model.transaction.collateral
-
-                maybeInterest : Maybe Float
-                maybeInterest =
-                    String.toFloat model.transaction.interest
-
-                startReserve : Reserve
-                startReserve =
-                    model.reserve
-            in
-            case initialTransaction.state of
-                Lend ->
-                    case ( maybeToken, maybeCollateral, maybeInterest ) of
-                        ( Just token, Just collateral, Just interest ) ->
-                            let
-                                newToken : Float
-                                newToken =
-                                    startReserve.token + token
-
-                                newCollateral : Float
-                                newCollateral =
-                                    startReserve.collateral - collateral
-
-                                newInterest : Float
-                                newInterest =
-                                    startReserve.interest - interest
-
-                                reserve : Reserve
-                                reserve =
-                                    { startReserve | token = newToken, collateral = newCollateral, interest = newInterest }
-
-                                deposit : Deposit
-                                deposit =
-                                    addDeposit (token + interest) collateral model.deposit
-
-                                transaction : Transaction
-                                transaction =
-                                    { initialTransaction | interest = getInterestLend token collateral reserve }
-                            in
-                            { model | reserve = reserve, transaction = transaction, deposit = deposit }
-
-                        _ ->
-                            model
-
-                Borrow ->
-                    case ( maybeToken, maybeCollateral, maybeInterest ) of
-                        ( Just token, Just collateral, Just interest ) ->
-                            let
-                                newToken : Float
-                                newToken =
-                                    startReserve.token - token
-
-                                newCollateral : Float
-                                newCollateral =
-                                    startReserve.collateral + collateral
-
-                                newInterest : Float
-                                newInterest =
-                                    startReserve.interest + interest
-
-                                reserve : Reserve
-                                reserve =
-                                    { startReserve | token = newToken, collateral = newCollateral, interest = newInterest }
-
-                                loan : List Loan
-                                loan =
-                                    addLoan (token + interest) collateral model.loan
-
-                                transaction : Transaction
-                                transaction =
-                                    { initialTransaction | interest = getInterestBorrow token collateral reserve }
-                            in
-                            { model | reserve = reserve, transaction = transaction, loan = loan }
-
-                        _ ->
-                            model
+        _ ->
+            ( model, Cmd.none )
 
 
-getInterestLend : Float -> Float -> Reserve -> String
+getCollateralMax : UnsignedInteger -> Reserve -> Result String UnsignedInteger
+getCollateralMax token reserve =
+    case Data.addBy token reserve.token of
+        Ok sum ->
+            token
+                |> Data.multiplyBy reserve.collateral
+                |> Result.andThen (Data.divideBy sum)
+
+        error ->
+            error
+
+
+getInterestMaxLend : UnsignedInteger -> Reserve -> Result String UnsignedInteger
+getInterestMaxLend token reserve =
+    case Data.addBy token reserve.token of
+        Ok sum ->
+            token
+                |> Data.multiplyBy reserve.interest
+                |> Result.andThen (Data.divideBy sum)
+
+        error ->
+            error
+
+
+getInterestLend : UnsignedInteger -> UnsignedInteger -> Reserve -> String
 getInterestLend token collateral reserve =
-    if collateral >= reserve.collateral then
+    if Data.greaterThan collateral reserve.collateral then
         ""
 
     else
         let
-            yMax : Float
-            yMax =
-                token * reserve.interest / (reserve.token + token)
+            resultCollateralMax : Result String UnsignedInteger
+            resultCollateralMax =
+                getCollateralMax token reserve
 
-            zMax : Float
-            zMax =
-                token * reserve.collateral / (reserve.token + token)
+            resultInterestMax : Result String UnsignedInteger
+            resultInterestMax =
+                getInterestMaxLend token reserve
         in
-        if collateral > zMax then
-            ""
+        case ( resultCollateralMax, resultInterestMax ) of
+            ( Ok collateralMax, Ok interestMax ) ->
+                if Data.greaterThan collateral collateralMax then
+                    ""
 
-        else
-            (yMax * (zMax - collateral) / zMax)
-                |> String.fromFloat
+                else
+                    case Data.subtractBy collateral collateralMax of
+                        Ok difference ->
+                            let
+                                resultInterest : Result String UnsignedInteger
+                                resultInterest =
+                                    interestMax
+                                        |> Data.multiplyBy difference
+                                        |> Result.andThen (Data.divideBy collateralMax)
+                            in
+                            case resultInterest of
+                                Ok interest ->
+                                    Data.fromUnsignedIntegerToToken interest
+
+                                _ ->
+                                    ""
+
+                        _ ->
+                            ""
+
+            _ ->
+                ""
 
 
-getInterestBorrow : Float -> Float -> Reserve -> String
+getCollateralMin : UnsignedInteger -> Reserve -> Result String UnsignedInteger
+getCollateralMin token reserve =
+    case Data.subtractBy token reserve.token of
+        Ok difference ->
+            token
+                |> Data.multiplyBy reserve.collateral
+                |> Result.andThen (Data.divideBy difference)
+
+        error ->
+            error
+
+
+getInterestMaxBorrow : UnsignedInteger -> Reserve -> Result String UnsignedInteger
+getInterestMaxBorrow token reserve =
+    case Data.subtractBy token reserve.token of
+        Ok difference ->
+            token
+                |> Data.multiplyBy reserve.interest
+                |> Result.andThen (Data.divideBy difference)
+
+        error ->
+            error
+
+
+getInterestBorrow : UnsignedInteger -> UnsignedInteger -> Reserve -> String
 getInterestBorrow token collateral reserve =
-    if token >= reserve.token then
+    if Data.greaterThan token reserve.token then
         ""
 
     else
         let
-            yMax : Float
-            yMax =
-                token * reserve.interest / (reserve.token - token)
+            resultCollateralMin : Result String UnsignedInteger
+            resultCollateralMin =
+                getCollateralMin token reserve
 
-            zMin : Float
-            zMin =
-                token * reserve.collateral / (reserve.token - token)
+            resultInterestMax : Result String UnsignedInteger
+            resultInterestMax =
+                getInterestMaxBorrow token reserve
         in
-        if collateral < zMin then
-            ""
+        case ( resultCollateralMin, resultInterestMax ) of
+            ( Ok collateralMin, Ok interestMax ) ->
+                if Data.greaterThan collateralMin collateral then
+                    ""
 
-        else
-            (yMax * zMin / collateral)
-                |> String.fromFloat
+                else
+                    let
+                        resultInterest : Result String UnsignedInteger
+                        resultInterest =
+                            interestMax
+                                |> Data.multiplyBy collateralMin
+                                |> Result.andThen (Data.divideBy collateral)
+                    in
+                    case resultInterest of
+                        Ok interest ->
+                            Data.fromUnsignedIntegerToToken interest
+
+                        _ ->
+                            ""
+
+            _ ->
+                ""
 
 
-getTokenLend : Float -> Float -> Reserve -> String
+getTokenLend : UnsignedInteger -> UnsignedInteger -> Reserve -> String
 getTokenLend collateral interest reserve =
-    if collateral >= reserve.collateral then
+    if Data.greaterThan collateral reserve.collateral then
         ""
 
     else
         let
-            w : Float
-            w =
-                ((interest * reserve.collateral) + (collateral * reserve.interest)) / (reserve.collateral * reserve.interest)
+            resultFirst : Result String UnsignedInteger
+            resultFirst =
+                collateral
+                    |> Data.multiplyBy reserve.interest
+
+            resultSecond : Result String UnsignedInteger
+            resultSecond =
+                interest
+                    |> Data.multiplyBy reserve.collateral
+
+            resultThird : Result String UnsignedInteger
+            resultThird =
+                reserve.collateral
+                    |> Data.multiplyBy reserve.interest
         in
-        if w <= 0 then
-            ""
+        case ( resultFirst, resultSecond, resultThird ) of
+            ( Ok first, Ok second, Ok third ) ->
+                let
+                    resultW : Result String UnsignedInteger
+                    resultW =
+                        first
+                            |> Data.addBy second
+                            |> Result.andThen (Data.divideBy third)
+                in
+                case resultW of
+                    Ok w ->
+                        if w == Data.unsignedIntegerZero then
+                            ""
 
-        else
-            (w * reserve.token / (1 - w))
-                |> String.fromFloat
+                        else
+                            case Data.subtractBy w Data.unsignedIntegerTokenOne of
+                                Ok difference ->
+                                    let
+                                        resultToken : Result String UnsignedInteger
+                                        resultToken =
+                                            w
+                                                |> Data.multiplyBy reserve.token
+                                                |> Result.andThen (Data.divideBy difference)
+                                    in
+                                    case resultToken of
+                                        Ok token ->
+                                            Data.fromUnsignedIntegerToToken token
+
+                                        _ ->
+                                            ""
+
+                                _ ->
+                                    ""
+
+                    _ ->
+                        ""
+
+            _ ->
+                ""
 
 
-getTokenBorrow : Float -> Float -> Reserve -> String
+getTokenBorrow : UnsignedInteger -> UnsignedInteger -> Reserve -> String
 getTokenBorrow collateral interest reserve =
     let
-        w : Float
-        w =
-            sqrt (collateral * interest / (reserve.collateral * reserve.interest))
+        resultDenominator : Result String UnsignedInteger
+        resultDenominator =
+            reserve.collateral
+                |> Data.multiplyBy reserve.interest
     in
-    if w <= 0 then
-        ""
+    case resultDenominator of
+        Ok denominator ->
+            let
+                resultW : Result String UnsignedInteger
+                resultW =
+                    collateral
+                        |> Data.multiplyBy interest
+                        |> Result.andThen (Data.divideBy denominator)
+                        |> Result.andThen Data.squareRoot
+            in
+            case resultW of
+                Ok w ->
+                    if w == Data.unsignedIntegerZero then
+                        ""
 
-    else
-        (w * reserve.token / (1 + w))
-            |> String.fromFloat
+                    else
+                        case Data.addBy w Data.unsignedIntegerTokenOne of
+                            Ok sum ->
+                                let
+                                    resultToken : Result String UnsignedInteger
+                                    resultToken =
+                                        w
+                                            |> Data.multiplyBy reserve.token
+                                            |> Result.andThen (Data.divideBy sum)
+                                in
+                                case resultToken of
+                                    Ok token ->
+                                        Data.fromUnsignedIntegerToToken token
+
+                                    _ ->
+                                        ""
+
+                            _ ->
+                                ""
+
+                _ ->
+                    ""
+
+        _ ->
+            ""
 
 
-addDeposit : Float -> Float -> Deposit -> Deposit
-addDeposit initialDeposit initialInsurance depositData =
+viewReserves : Log -> Outcome
+viewReserves log =
     let
-        deposit : Float
-        deposit =
-            depositData.deposit + initialDeposit
+        parameter : List ( String, Value )
+        parameter =
+            [ ( "to", Data.addressEncode Data.addressTimeswapPool )
+            , ( "data", Data.encode Data.viewReserves )
+            ]
 
-        insurance : Float
-        insurance =
-            depositData.insurance + initialInsurance
+        nextLog : Log
+        nextLog =
+            next ViewReserves log
+
+        value : Value
+        value =
+            Encode.object
+                [ ( "id", idEncode nextLog )
+                , ( "jsonrpc", jsonrpcEncode )
+                , ( "method", methodEncode Call )
+                , ( "params", parameterEncode parameter )
+                ]
     in
-    { depositData | deposit = deposit, insurance = insurance }
+    Outcome value nextLog
 
 
-addLoan : Float -> Float -> List Loan -> List Loan
-addLoan initialLoan initialCollateral loanData =
+depositOf : Address -> Log -> Outcome
+depositOf owner log =
     let
-        loan : Float
-        loan =
-            initialLoan
+        parameter : List ( String, Value )
+        parameter =
+            [ ( "to", Data.addressEncode Data.addressTimeswapPool )
+            , ( "data", Data.encode <| Data.depositOf owner )
+            ]
 
-        collateral : Float
-        collateral =
-            initialCollateral
+        nextLog : Log
+        nextLog =
+            next DepositOf log
+
+        value : Value
+        value =
+            Encode.object
+                [ ( "id", idEncode nextLog )
+                , ( "jsonrpc", jsonrpcEncode )
+                , ( "method", methodEncode Call )
+                , ( "params", parameterEncode parameter )
+                ]
     in
-    Loan loan collateral :: loanData
+    Outcome value nextLog
+
+
+loanOf : Address -> UnsignedInteger -> Log -> Outcome
+loanOf owner index log =
+    let
+        parameter : List ( String, Value )
+        parameter =
+            [ ( "to", Data.addressEncode Data.addressTimeswapPool )
+            , ( "data", Data.encode <| Data.loanOf owner index )
+            ]
+
+        nextLog : Log
+        nextLog =
+            next (LoanOf index) log
+
+        value : Value
+        value =
+            Encode.object
+                [ ( "id", idEncode nextLog )
+                , ( "jsonrpc", jsonrpcEncode )
+                , ( "method", methodEncode Call )
+                , ( "params", parameterEncode parameter )
+                ]
+    in
+    Outcome value nextLog
+
+
+allowanceToken : Address -> Log -> Outcome
+allowanceToken owner log =
+    let
+        parameter : List ( String, Value )
+        parameter =
+            [ ( "to", Data.addressEncode Data.addressDaiTSDemo )
+            , ( "data", Data.encode <| Data.allowance owner Data.addressTimeswapConvenience )
+            ]
+
+        nextLog : Log
+        nextLog =
+            next AllowanceToken log
+
+        value : Value
+        value =
+            Encode.object
+                [ ( "id", idEncode nextLog )
+                , ( "jsonrpc", jsonrpcEncode )
+                , ( "method", methodEncode Call )
+                , ( "params", parameterEncode parameter )
+                ]
+    in
+    Outcome value nextLog
+
+
+allowanceCollateral : Address -> Log -> Outcome
+allowanceCollateral owner log =
+    let
+        parameter : List ( String, Value )
+        parameter =
+            [ ( "to", Data.addressEncode Data.addressFileTSDemo )
+            , ( "data", Data.encode <| Data.allowance owner Data.addressTimeswapConvenience )
+            ]
+
+        nextLog : Log
+        nextLog =
+            next AllowanceCollateral log
+
+        value : Value
+        value =
+            Encode.object
+                [ ( "id", idEncode nextLog )
+                , ( "jsonrpc", jsonrpcEncode )
+                , ( "method", methodEncode Call )
+                , ( "params", parameterEncode parameter )
+                ]
+    in
+    Outcome value nextLog
+
+
+approveToken : Address -> Log -> Outcome
+approveToken sender log =
+    let
+        parameter : List ( String, Value )
+        parameter =
+            [ ( "from", Data.addressEncode sender )
+            , ( "to", Data.addressEncode Data.addressDaiTSDemo )
+            , ( "data", Data.encode <| Data.approve Data.addressTimeswapConvenience Data.unsignedIntegerMaxInteger )
+            ]
+
+        nextLog : Log
+        nextLog =
+            next ApproveToken log
+
+        value : Value
+        value =
+            Encode.object
+                [ ( "id", idEncode nextLog )
+                , ( "jsonrpc", jsonrpcEncode )
+                , ( "method", methodEncode SendTransaction )
+                , ( "params", parameterEncode parameter )
+                ]
+    in
+    Outcome value nextLog
+
+
+approveCollateral : Address -> Log -> Outcome
+approveCollateral sender log =
+    let
+        parameter : List ( String, Value )
+        parameter =
+            [ ( "from", Data.addressEncode sender )
+            , ( "to", Data.addressEncode Data.addressFileTSDemo )
+            , ( "data", Data.encode <| Data.approve Data.addressTimeswapConvenience Data.unsignedIntegerMaxInteger )
+            ]
+
+        nextLog : Log
+        nextLog =
+            next ApproveCollateral log
+
+        value : Value
+        value =
+            Encode.object
+                [ ( "id", idEncode nextLog )
+                , ( "jsonrpc", jsonrpcEncode )
+                , ( "method", methodEncode SendTransaction )
+                , ( "params", parameterEncode parameter )
+                ]
+    in
+    Outcome value nextLog
+
+
+lend : UnsignedInteger -> UnsignedInteger -> Address -> Log -> Outcome
+lend token collateral sender log =
+    let
+        parameter : List ( String, Value )
+        parameter =
+            [ ( "from", Data.addressEncode sender )
+            , ( "to", Data.addressEncode Data.addressTimeswapConvenience )
+            , ( "data", Data.encode <| Data.lend Data.addressTimeswapPool token collateral sender )
+            ]
+
+        nextLog : Log
+        nextLog =
+            next Lending log
+
+        value : Value
+        value =
+            Encode.object
+                [ ( "id", idEncode nextLog )
+                , ( "jsonrpc", jsonrpcEncode )
+                , ( "method", methodEncode SendTransaction )
+                , ( "params", parameterEncode parameter )
+                ]
+    in
+    Outcome value nextLog
+
+
+borrow : UnsignedInteger -> UnsignedInteger -> Address -> Log -> Outcome
+borrow token collateral sender log =
+    let
+        parameter : List ( String, Value )
+        parameter =
+            [ ( "from", Data.addressEncode sender )
+            , ( "to", Data.addressEncode Data.addressTimeswapConvenience )
+            , ( "data", Data.encode <| Data.borrow Data.addressTimeswapPool token collateral sender )
+            ]
+
+        nextLog : Log
+        nextLog =
+            next Borrowing log
+
+        value : Value
+        value =
+            Encode.object
+                [ ( "id", idEncode nextLog )
+                , ( "jsonrpc", jsonrpcEncode )
+                , ( "method", methodEncode SendTransaction )
+                , ( "params", parameterEncode parameter )
+                ]
+    in
+    Outcome value nextLog
+
+
+next : Function -> Log -> Log
+next function { id, record } =
+    let
+        nextId : Int
+        nextId =
+            id + 1
+
+        nextRecord : Record
+        nextRecord =
+            Dict.insert nextId function record
+    in
+    { id = nextId
+    , record = nextRecord
+    }
+
+
+idEncode : Log -> Value
+idEncode { id } =
+    Encode.int id
+
+
+jsonrpcEncode : Value
+jsonrpcEncode =
+    Encode.string "2.0"
+
+
+methodEncode : Method -> Value
+methodEncode method =
+    case method of
+        Call ->
+            Encode.string "eth_call"
+
+        SendTransaction ->
+            Encode.string "eth_sendTransaction"
+
+
+parameterEncode : List ( String, Value ) -> Value
+parameterEncode parameter =
+    Encode.list Encode.object <| List.singleton parameter
+
+
+
+-- SUBSCRIPTIONS
+
+
+subscriptions : Model -> Sub Msg
+subscriptions { state } =
+    case state of
+        Rinkeby _ ->
+            Sub.batch
+                [ Browser.Events.onResize ChangeWindow
+                , receiveUser ReceiveUser
+                , receiveNetwork ReceiveNetwork
+                , receiveTransaction ReceiveTransaction
+                , Time.every 10000 Check
+                ]
+
+        NotConnected ->
+            Sub.batch
+                [ Browser.Events.onResize ChangeWindow
+                , receiveConnect ReceiveConnect
+                ]
+
+        NoMetamask ->
+            Browser.Events.onResize ChangeWindow
+
+
+
+-- PORT
+
+
+port sendConnect : () -> Cmd msg
+
+
+port sendTransaction : Value -> Cmd msg
+
+
+port receiveConnect : (Value -> msg) -> Sub msg
+
+
+port receiveUser : (Value -> msg) -> Sub msg
+
+
+port receiveNetwork : (Value -> msg) -> Sub msg
+
+
+port receiveTransaction : (Value -> msg) -> Sub msg
 
 
 
@@ -494,8 +1525,8 @@ addLoan initialLoan initialCollateral loanData =
 
 view : Model -> Html Msg
 view model =
-    layoutWith
-        { options = [ focusStyle focus ] }
+    Element.layoutWith
+        { options = [ Element.focusStyle focus ] }
         []
         (viewElement model)
 
@@ -510,108 +1541,157 @@ focus =
 
 viewElement : Model -> Element Msg
 viewElement model =
-    column
-        [ width fill
-        , height fill
-        , Background.color imperfectWhite
-        ]
-        [ viewHeader
-        , viewBody model
-        ]
+    case model.state of
+        Rinkeby info ->
+            Element.column
+                [ Element.width Element.fill
+                , Element.height Element.fill
+                , Background.color imperfectWhite
+                ]
+                [ viewHeader info.user
+                , viewBody info
+                ]
+
+        NotConnected ->
+            Element.column
+                [ Element.width Element.fill
+                , Element.height Element.fill
+                , Background.color imperfectWhite
+                ]
+                [ viewHeaderNotConnected
+                , Element.none -- Add More
+                ]
+
+        NoMetamask ->
+            Element.none
 
 
-viewHeader : Element Msg
-viewHeader =
-    row
-        [ width fill
-        , height <| px 72
-        , padding 12
+
+-- Add More
+
+
+viewHeaderNotConnected : Element Msg
+viewHeaderNotConnected =
+    Element.row
+        [ Element.width Element.fill
+        , Element.height <| Element.px 72
+        , Element.padding 12
         ]
         [ viewLogo
-        , viewWallet
+        , viewWalletNotConnected
         ]
 
 
-viewLogo : Element Msg
-viewLogo =
-    Image.toElement
-        [ width <| px 200
-        , height shrink
-        ]
-        Image.timeswapDayLogo
-
-
-viewWallet : Element Msg
-viewWallet =
-    el
-        [ paddingXY 18 9
-        , alignRight
+viewWalletNotConnected : Element Msg
+viewWalletNotConnected =
+    Input.button
+        [ Element.paddingXY 18 9
+        , Element.alignRight
         , Background.color blue
         , Border.rounded 30
         , Font.color imperfectWhite
         , Font.size 18
         , Font.family lato
         ]
-        (text "matheprenuer.eth")
+        { onPress = Just SendConnect
+        , label = Element.text "Connect Metamask"
+        }
 
 
-viewBody : Model -> Element Msg
-viewBody model =
-    row
-        [ width fill
-        , height fill
-        , paddingXY 20 100
-        , spacing 20
+viewHeader : Address -> Element Msg
+viewHeader address =
+    Element.row
+        [ Element.width Element.fill
+        , Element.height <| Element.px 72
+        , Element.padding 12
         ]
-        [ viewAsset model.deposit
-        , viewLiability model.loan
-        , viewSwap model
+        [ viewLogo
+        , viewWallet address
         ]
 
 
-viewSwap : Model -> Element Msg
-viewSwap model =
-    case model.transaction.state of
+viewLogo : Element Msg
+viewLogo =
+    Image.toElement
+        [ Element.width <| Element.px 200
+        , Element.height Element.shrink
+        ]
+        Image.timeswapDayLogo
+
+
+viewWallet : Address -> Element Msg
+viewWallet address =
+    Element.el
+        [ Element.paddingXY 18 9
+        , Element.alignRight
+        , Background.color blue
+        , Border.rounded 30
+        , Font.color imperfectWhite
+        , Font.size 18
+        , Font.family lato
+        ]
+        (Data.fromAddressToTextShort address)
+
+
+viewBody : Info -> Element Msg
+viewBody info =
+    Element.row
+        [ Element.width Element.fill
+        , Element.height Element.fill
+        , Element.paddingXY 20 100
+        , Element.spacing 20
+        ]
+        [ viewAsset info.deposit
+        , viewLiability info.loan
+        , viewSwap info
+        ]
+
+
+viewSwap : Info -> Element Msg
+viewSwap info =
+    case info.transaction.transactionType of
         Lend ->
-            column
-                [ width <| px 400
-                , padding 20
-                , spacing 20
-                , centerX
-                , alignTop
+            Element.column
+                [ Element.width <| Element.px 400
+                , Element.padding 20
+                , Element.spacing 20
+                , Element.centerX
+                , Element.alignTop
                 , Background.color dirtyWhite
                 , Border.rounded 30
                 ]
                 [ viewLendTabs
-                , viewToken model.transaction.token
-                , viewInsurance model.transaction.token model.transaction.collateral model.reserve
-                , viewInterest model.transaction.token model.transaction.interest
-                , viewSwapButton
+                , viewToken info.transaction.token
+                , viewInsurance info.transaction.token info.transaction.collateral info.reserve
+                , viewInterest info.transaction.token info.transaction.interest
+                , viewApproveButton info.tokenApproved
+                , viewSwapButton info.tokenApproved info.transaction
                 ]
 
         Borrow ->
-            column
-                [ width <| px 400
-                , padding 20
-                , spacing 20
-                , centerX
-                , alignTop
+            Element.column
+                [ Element.width <| Element.px 400
+                , Element.padding 20
+                , Element.spacing 20
+                , Element.centerX
+                , Element.alignTop
                 , Background.color dirtyWhite
                 , Border.rounded 30
                 ]
                 [ viewBorrowTabs
-                , viewToken model.transaction.token
-                , viewCollateral model.transaction.token model.transaction.collateral model.reserve
-                , viewInterest model.transaction.token model.transaction.interest
-                , viewSwapButton
+                , viewToken info.transaction.token
+                , viewCollateral info.transaction.token info.transaction.collateral info.reserve
+                , viewInterest info.transaction.token info.transaction.interest
+                , viewApproveButton info.collateralApproved
+                , viewSwapButton info.collateralApproved info.transaction
                 ]
 
 
 viewLendTabs : Element Msg
 viewLendTabs =
-    row
-        [ width fill
-        , padding 10
+    Element.row
+        [ Element.width Element.fill
+        , Element.padding 10
         , Background.color dirtyWhite
         ]
         [ viewLendTabChosen
@@ -621,9 +1701,9 @@ viewLendTabs =
 
 viewBorrowTabs : Element Msg
 viewBorrowTabs =
-    row
-        [ width fill
-        , padding 10
+    Element.row
+        [ Element.width Element.fill
+        , Element.padding 10
         , Background.color dirtyWhite
         ]
         [ viewLendTab
@@ -634,134 +1714,139 @@ viewBorrowTabs =
 viewLendTab : Element Msg
 viewLendTab =
     Input.button
-        [ width fill
+        [ Element.width Element.fill
         , Font.color gray
         , Font.size 24
         , Font.family lato
         , Font.center
         ]
         { onPress = Just SwitchToLend
-        , label = text "Lend"
+        , label = Element.text "Lend"
         }
 
 
 viewLendTabChosen : Element Msg
 viewLendTabChosen =
     Input.button
-        [ width fill
+        [ Element.width Element.fill
         , Font.color imperfectBlack
         , Font.size 24
         , Font.family lato
         , Font.center
         ]
-        { onPress = Just SwitchToLend
-        , label = text "Lend"
+        { onPress = Nothing
+        , label = Element.text "Lend"
         }
 
 
 viewBorrowTab : Element Msg
 viewBorrowTab =
     Input.button
-        [ width fill
+        [ Element.width Element.fill
         , Font.color gray
         , Font.size 24
         , Font.family lato
         , Font.center
         ]
         { onPress = Just SwitchToBorrow
-        , label = text "Borrow"
+        , label = Element.text "Borrow"
         }
 
 
 viewBorrowTabChosen : Element Msg
 viewBorrowTabChosen =
     Input.button
-        [ width fill
+        [ Element.width Element.fill
         , Font.color imperfectBlack
         , Font.size 24
         , Font.family lato
         , Font.center
         ]
-        { onPress = Just SwitchToBorrow
-        , label = text "Borrow"
+        { onPress = Nothing
+        , label = Element.text "Borrow"
         }
 
 
 viewToken : String -> Element Msg
 viewToken token =
-    column
-        [ width fill
-        , padding 20
-        , spacing 10
+    Element.column
+        [ Element.width Element.fill
+        , Element.padding 20
+        , Element.spacing 10
         , Background.color imperfectWhite
         , Border.rounded 30
         ]
         [ viewInputTokenDetails
-        , viewInput token "DAI" ChangeInputAmount
+        , viewInput token "DAI" ChangeTokenAmount
         ]
 
 
-viewInsurance : String -> String -> Reserve -> Element Msg
-viewInsurance token collateral reserve =
-    column
-        [ width fill
-        , padding 20
-        , spacing 10
+viewInsurance : String -> String -> Maybe Reserve -> Element Msg
+viewInsurance token collateral maybeReserve =
+    Element.column
+        [ Element.width Element.fill
+        , Element.padding 20
+        , Element.spacing 10
         , Background.color imperfectWhite
         , Border.rounded 30
         ]
-        [ viewInputInsuranceDetails <| getZMax token reserve
-        , viewInput collateral "ETH" ChangeCollateralAmount
+        [ viewInputInsuranceDetails <| unsignedIntegerToString <| getCollateralMaxMaybe (Data.toUnsignedIntegerFromStringToken token) maybeReserve
+        , viewInput collateral "FILE" ChangeCollateralAmount
         ]
 
 
-viewCollateral : String -> String -> Reserve -> Element Msg
-viewCollateral token collateral reserve =
-    column
-        [ width fill
-        , padding 20
-        , spacing 10
+viewCollateral : String -> String -> Maybe Reserve -> Element Msg
+viewCollateral token collateral maybeReserve =
+    Element.column
+        [ Element.width Element.fill
+        , Element.padding 20
+        , Element.spacing 10
         , Background.color imperfectWhite
         , Border.rounded 30
         ]
-        [ viewInputCollateralDetails <| getZMin token reserve
-        , viewInput collateral "ETH" ChangeCollateralAmount
+        [ viewInputCollateralDetails <| unsignedIntegerToString <| getCollateralMinMaybe (Data.toUnsignedIntegerFromStringToken token) maybeReserve
+        , viewInput collateral "FILE" ChangeCollateralAmount
         ]
 
 
-getZMax : String -> Reserve -> Maybe String
-getZMax token reserve =
-    let
-        getMax : Float -> String
-        getMax float =
-            float * reserve.collateral / (reserve.token + float) |> roundDownMain |> String.fromFloat
-    in
-    String.toFloat token
-        |> Maybe.map getMax
+getCollateralMaxMaybe : Result String UnsignedInteger -> Maybe Reserve -> Result String UnsignedInteger
+getCollateralMaxMaybe resultToken maybeReserve =
+    case ( resultToken, maybeReserve ) of
+        ( Ok token, Just reserve ) ->
+            getCollateralMax token reserve
+
+        _ ->
+            Err "No Reserve"
 
 
-getZMin : String -> Reserve -> Maybe String
-getZMin token reserve =
-    let
-        getMin : Float -> String
-        getMin float =
-            float * reserve.collateral / (reserve.token - float) |> roundDownMain |> String.fromFloat
-    in
-    String.toFloat token
-        |> Maybe.map getMin
+getCollateralMinMaybe : Result String UnsignedInteger -> Maybe Reserve -> Result String UnsignedInteger
+getCollateralMinMaybe resultToken maybeReserve =
+    case ( resultToken, maybeReserve ) of
+        ( Ok token, Just reserve ) ->
+            getCollateralMin token reserve
+
+        _ ->
+            Err "No Reserve"
+
+
+unsignedIntegerToString : Result String UnsignedInteger -> Maybe String
+unsignedIntegerToString resultCollateral =
+    resultCollateral
+        |> Result.map Data.fromUnsignedIntegerToToken
+        |> Result.toMaybe
 
 
 viewInterest : String -> String -> Element Msg
 viewInterest token interest =
-    column
-        [ width fill
-        , padding 20
-        , spacing 10
+    Element.column
+        [ Element.width Element.fill
+        , Element.padding 20
+        , Element.spacing 10
         , Background.color imperfectWhite
         , Border.rounded 30
         ]
         [ viewInputInterestDetails <| getAPR token interest
-        , viewInput interest "DAI" ChangeOutputAmount
+        , viewInput interest "DAI" ChangeInterestAmount
         ]
 
 
@@ -785,15 +1870,15 @@ getAPR token interest =
 
 viewInputTokenDetails : Element Msg
 viewInputTokenDetails =
-    el
-        [ width fill ]
+    Element.el
+        [ Element.width Element.fill ]
         viewPrincipalText
 
 
 viewInputInsuranceDetails : Maybe String -> Element Msg
 viewInputInsuranceDetails maybeLimit =
-    row
-        [ width fill ]
+    Element.row
+        [ Element.width Element.fill ]
         [ viewInsuranceText
         , viewMaximumInsurance maybeLimit
         ]
@@ -801,8 +1886,8 @@ viewInputInsuranceDetails maybeLimit =
 
 viewInputCollateralDetails : Maybe String -> Element Msg
 viewInputCollateralDetails maybeLimit =
-    row
-        [ width fill ]
+    Element.row
+        [ Element.width Element.fill ]
         [ viewCollateralText
         , viewMinimumCollateral maybeLimit
         ]
@@ -810,8 +1895,8 @@ viewInputCollateralDetails maybeLimit =
 
 viewInputInterestDetails : Maybe String -> Element Msg
 viewInputInterestDetails maybePercent =
-    row
-        [ width fill ]
+    Element.row
+        [ Element.width Element.fill ]
         [ viewInterestText
         , viewPercent maybePercent
         ]
@@ -819,120 +1904,120 @@ viewInputInterestDetails maybePercent =
 
 viewPrincipalText : Element Msg
 viewPrincipalText =
-    el
-        [ padding 5
+    Element.el
+        [ Element.padding 5
         , Border.rounded 30
         , Font.color imperfectBlack
         , Font.size 14
         , Font.family lato
         ]
-        (text "Principal")
+        (Element.text "Principal")
 
 
 viewInsuranceText : Element Msg
 viewInsuranceText =
-    el
-        [ padding 5
+    Element.el
+        [ Element.padding 5
         , Border.rounded 30
         , Font.color imperfectBlack
         , Font.size 14
         , Font.family lato
         ]
-        (text "Insurance")
+        (Element.text "Insurance")
 
 
 viewCollateralText : Element Msg
 viewCollateralText =
-    el
-        [ padding 5
+    Element.el
+        [ Element.padding 5
         , Border.rounded 30
         , Font.color imperfectBlack
         , Font.size 14
         , Font.family lato
         ]
-        (text "Collateral")
+        (Element.text "Collateral")
 
 
 viewInterestText : Element Msg
 viewInterestText =
-    el
-        [ padding 5
+    Element.el
+        [ Element.padding 5
         , Border.rounded 30
         , Font.color imperfectBlack
         , Font.size 14
         , Font.family lato
         ]
-        (text "Interest on December 30, 2020")
+        (Element.text "Interest on August 5, 2021")
 
 
 viewMaximumInsurance : Maybe String -> Element Msg
 viewMaximumInsurance maybeLimit =
     case maybeLimit of
         Just limit ->
-            el
-                [ alignRight
-                , padding 5
+            Element.el
+                [ Element.alignRight
+                , Element.padding 5
                 , Border.rounded 30
                 , Font.color imperfectBlack
                 , Font.size 14
                 , Font.family lato
                 ]
-                (text <| "Maximum " ++ limit)
+                (Element.text <| "Maximum " ++ limit)
 
         Nothing ->
-            none
+            Element.none
 
 
 viewMinimumCollateral : Maybe String -> Element Msg
 viewMinimumCollateral maybeLimit =
     case maybeLimit of
         Just limit ->
-            el
-                [ alignRight
-                , padding 5
+            Element.el
+                [ Element.alignRight
+                , Element.padding 5
                 , Border.rounded 30
                 , Font.color imperfectBlack
                 , Font.size 14
                 , Font.family lato
                 ]
-                (text <| "Minimum " ++ limit)
+                (Element.text <| "Minimum " ++ limit)
 
         Nothing ->
-            none
+            Element.none
 
 
 viewPercent : Maybe String -> Element Msg
 viewPercent maybePercent =
     case maybePercent of
         Just percent ->
-            el
-                [ alignRight
-                , padding 5
+            Element.el
+                [ Element.alignRight
+                , Element.padding 5
                 , Border.rounded 30
                 , Font.color imperfectBlack
                 , Font.size 14
                 , Font.family lato
                 ]
-                (text <| "APR " ++ percent ++ "%")
+                (Element.text <| "APR " ++ percent ++ "%")
 
         Nothing ->
-            none
+            Element.none
 
 
 viewArrow : Element Msg
 viewArrow =
     Image.toElement
-        [ width <| px 10
-        , height shrink
+        [ Element.width <| Element.px 10
+        , Element.height Element.shrink
         ]
         Image.chevronDown
 
 
 viewInput : String -> String -> (String -> Msg) -> Element Msg
 viewInput string currency msg =
-    row
-        [ width fill
-        , spacing 10
+    Element.row
+        [ Element.width Element.fill
+        , Element.spacing 10
         ]
         [ viewInputNumber string msg
         , viewTokenInput currency
@@ -942,7 +2027,7 @@ viewInput string currency msg =
 viewInputNumber : String -> (String -> Msg) -> Element Msg
 viewInputNumber text msg =
     Input.text
-        [ padding 5
+        [ Element.padding 5
         , Background.color imperfectWhite
         , Border.width 0
         , Font.color imperfectBlack
@@ -963,18 +2048,18 @@ viewZeros =
         , Font.size 24
         , Font.family lato
         ]
-        (text "0.0")
+        (Element.text "0.0")
 
 
 viewTokenInput : String -> Element Msg
 viewTokenInput string =
     Input.button
-        [ width shrink
-        , height fill
-        , padding 5
+        [ Element.width Element.shrink
+        , Element.height Element.fill
+        , Element.padding 5
         , Border.rounded 30
-        , mouseOver [ Background.color dirtyWhite ]
-        , alignRight
+        , Element.mouseOver [ Background.color dirtyWhite ]
+        , Element.alignRight
         ]
         { onPress = Nothing
         , label = viewCurrency string
@@ -983,78 +2068,155 @@ viewTokenInput string =
 
 viewCurrency : String -> Element Msg
 viewCurrency currency =
-    row
-        [ spacing 5
+    Element.row
+        [ Element.spacing 5
         , Font.color imperfectBlack
         , Font.size 24
         , Font.family lato
         ]
-        [ text currency
+        [ Element.text currency
         , viewArrow
         ]
 
 
-viewSwapButton : Element Msg
-viewSwapButton =
-    Input.button
-        [ width fill
-        , padding 12
-        , Background.color blue
-        , Border.rounded 30
-        , Font.color imperfectWhite
-        , Font.size 24
-        , Font.family lato
-        , Font.center
-        ]
-        { onPress = Just Swap
-        , label = text "Swap"
-        }
+viewApproveButton : Maybe Approved -> Element Msg
+viewApproveButton approved =
+    case approved of
+        Just Approved ->
+            Element.none
+
+        Just NotApproved ->
+            Input.button
+                [ Element.width Element.fill
+                , Element.padding 12
+                , Background.color blue
+                , Border.rounded 30
+                , Font.color imperfectWhite
+                , Font.size 24
+                , Font.family lato
+                , Font.center
+                ]
+                { onPress = Just Approve
+                , label = Element.text "Approve"
+                }
+
+        Nothing ->
+            Element.none
+
+
+viewSwapButton : Maybe Approved -> Transaction -> Element Msg
+viewSwapButton approved transaction =
+    case approved of
+        Just Approved ->
+            let
+                resultToken : Result String UnsignedInteger
+                resultToken =
+                    Data.toUnsignedIntegerFromStringToken transaction.token
+
+                resultCollateral : Result String UnsignedInteger
+                resultCollateral =
+                    Data.toUnsignedIntegerFromStringToken transaction.collateral
+
+                resultInterest : Result String UnsignedInteger
+                resultInterest =
+                    Data.toUnsignedIntegerFromStringToken transaction.interest
+            in
+            case ( resultToken, resultCollateral, resultInterest ) of
+                ( Ok _, Ok _, Ok _ ) ->
+                    Input.button
+                        [ Element.width Element.fill
+                        , Element.padding 12
+                        , Background.color blue
+                        , Border.rounded 30
+                        , Font.color imperfectWhite
+                        , Font.size 24
+                        , Font.family lato
+                        , Font.center
+                        ]
+                        { onPress = Just Swap
+                        , label = Element.text "Swap"
+                        }
+
+                _ ->
+                    Input.button
+                        [ Element.width Element.fill
+                        , Element.padding 12
+                        , Background.color gray
+                        , Border.rounded 30
+                        , Font.color imperfectWhite
+                        , Font.size 24
+                        , Font.family lato
+                        , Font.center
+                        ]
+                        { onPress = Nothing
+                        , label = Element.text "Enter an Amount"
+                        }
+
+        _ ->
+            Input.button
+                [ Element.width Element.fill
+                , Element.padding 12
+                , Background.color gray
+                , Border.rounded 30
+                , Font.color imperfectWhite
+                , Font.size 24
+                , Font.family lato
+                , Font.center
+                ]
+                { onPress = Nothing
+                , label = Element.text "Requires Approval"
+                }
 
 
 
 -- VIEW ASSET
 
 
-viewAsset : Deposit -> Element Msg
-viewAsset deposit =
-    if deposit == noDeposit then
-        none
+viewAsset : Maybe Deposit -> Element Msg
+viewAsset maybeDeposit =
+    case maybeDeposit of
+        Nothing ->
+            Element.none
 
-    else
-        column
-            [ width <| px 400
-            , padding 20
-            , spacing 20
-            , centerX
-            , alignTop
-            , Background.color dirtyWhite
-            , Border.rounded 30
-            , clipY
-            , scrollbarX
-            ]
-            [ viewDepositTitle
-            , viewDepositBox deposit
-            ]
+        Just deposit ->
+            if deposit.deposit == Data.unsignedIntegerZero && deposit.insurance == Data.unsignedIntegerZero then
+                Element.none
+
+            else
+                Element.column
+                    [ Element.width <| Element.px 400
+                    , Element.padding 20
+                    , Element.spacing 20
+                    , Element.centerX
+                    , Element.alignTop
+                    , Background.color dirtyWhite
+                    , Border.rounded 30
+                    , Element.clipY
+                    , Element.scrollbarX
+                    ]
+                    [ viewDepositTitle
+                    , viewDepositBox deposit
+                    ]
 
 
 viewDepositTitle : Element Msg
 viewDepositTitle =
-    el
-        [ width fill
+    Element.el
+        [ Element.width Element.fill
         , Font.color gray
         , Font.size 24
         , Font.family lato
         , Font.center
         ]
-        (text "Deposit")
+        (Element.text "Deposit")
 
 
 viewDepositBox : Deposit -> Element Msg
 viewDepositBox { deposit, insurance } =
-    column
-        [ width fill
-        , padding 20
-        , spacing 10
+    Element.column
+        [ Element.width Element.fill
+        , Element.padding 20
+        , Element.spacing 10
         , Background.color imperfectWhite
         , Border.rounded 30
         ]
@@ -1063,33 +2225,33 @@ viewDepositBox { deposit, insurance } =
         ]
 
 
-viewDeposit : Float -> Element Msg
+viewDeposit : UnsignedInteger -> Element Msg
 viewDeposit deposit =
-    row
-        [ width fill
-        , padding 5
-        , spacing 10
+    Element.row
+        [ Element.width Element.fill
+        , Element.padding 5
+        , Element.spacing 10
         , Font.color imperfectBlack
         , Font.size 24
         , Font.family lato
         ]
-        [ text <| String.fromFloat deposit
-        , el [ alignRight ] <| text "DAI"
+        [ Element.text <| Maybe.withDefault "" <| unsignedIntegerToString <| Ok deposit
+        , Element.el [ Element.alignRight ] <| Element.text "DAI"
         ]
 
 
-viewDepositInsurance : Float -> Element Msg
+viewDepositInsurance : UnsignedInteger -> Element Msg
 viewDepositInsurance insurance =
-    row
-        [ width fill
-        , padding 5
-        , spacing 10
+    Element.row
+        [ Element.width Element.fill
+        , Element.padding 5
+        , Element.spacing 10
         , Font.color imperfectBlack
         , Font.size 24
         , Font.family lato
         ]
-        [ text <| String.fromFloat insurance
-        , el [ alignRight ] <| text "ETH"
+        [ Element.text <| Maybe.withDefault "" <| unsignedIntegerToString <| Ok insurance
+        , Element.el [ Element.alignRight ] <| Element.text "FILE"
         ]
 
 
@@ -1097,44 +2259,44 @@ viewDepositInsurance insurance =
 -- VIEW LIABILITY LIST
 
 
-viewLiability : List Loan -> Element Msg
-viewLiability listLoan =
-    if listLoan == [] then
-        none
+viewLiability : Sort.Dict.Dict UnsignedInteger Loan -> Element Msg
+viewLiability dictionaryLoan =
+    if dictionaryLoan == Sort.Dict.empty Data.sorter then
+        Element.none
 
     else
-        column
-            [ width <| px 400
-            , padding 20
-            , spacing 20
-            , centerX
-            , alignTop
+        Element.column
+            [ Element.width <| Element.px 400
+            , Element.padding 20
+            , Element.spacing 20
+            , Element.centerX
+            , Element.alignTop
             , Background.color dirtyWhite
             , Border.rounded 30
-            , clipY
-            , scrollbarX
+            , Element.clipY
+            , Element.scrollbarX
             ]
-            (viewDebtTitle :: List.map viewLoanBox (List.reverse listLoan))
+            (viewDebtTitle :: List.map viewLoanBox (List.reverse <| Sort.Dict.values dictionaryLoan))
 
 
 viewDebtTitle : Element Msg
 viewDebtTitle =
-    el
-        [ width fill
+    Element.el
+        [ Element.width Element.fill
         , Font.color gray
         , Font.size 24
         , Font.family lato
         , Font.center
         ]
-        (text "Debt")
+        (Element.text "Debt")
 
 
 viewLoanBox : Loan -> Element Msg
 viewLoanBox { loan, collateral } =
-    column
-        [ width fill
-        , padding 20
-        , spacing 10
+    Element.column
+        [ Element.width Element.fill
+        , Element.padding 20
+        , Element.spacing 10
         , Background.color imperfectWhite
         , Border.rounded 30
         ]
@@ -1143,39 +2305,34 @@ viewLoanBox { loan, collateral } =
         ]
 
 
-viewLoan : Float -> Element Msg
+viewLoan : UnsignedInteger -> Element Msg
 viewLoan loan =
-    row
-        [ width fill
-        , padding 5
-        , spacing 10
+    Element.row
+        [ Element.width Element.fill
+        , Element.padding 5
+        , Element.spacing 10
         , Font.color imperfectBlack
         , Font.size 24
         , Font.family lato
         ]
-        [ text <| String.fromFloat loan
-        , el [ alignRight ] <| text "DAI"
+        [ Element.text <| Maybe.withDefault "" <| unsignedIntegerToString <| Ok loan
+        , Element.el [ Element.alignRight ] <| Element.text "DAI"
         ]
 
 
-viewLoanCollateral : Float -> Element Msg
+viewLoanCollateral : UnsignedInteger -> Element Msg
 viewLoanCollateral collateral =
-    row
-        [ width fill
-        , padding 5
-        , spacing 10
+    Element.row
+        [ Element.width Element.fill
+        , Element.padding 5
+        , Element.spacing 10
         , Font.color imperfectBlack
         , Font.size 24
         , Font.family lato
         ]
-        [ text <| String.fromFloat collateral
-        , el [ alignRight ] <| text "ETH"
+        [ Element.text <| Maybe.withDefault "" <| unsignedIntegerToString <| Ok collateral
+        , Element.el [ Element.alignRight ] <| Element.text "FILE"
         ]
-
-
-roundDownMain : Float -> Float
-roundDownMain =
-    roundDown 6
 
 
 roundDownPercent : Float -> Float
@@ -1205,7 +2362,7 @@ lato =
 
 imperfectWhite : Color
 imperfectWhite =
-    fromRgb255
+    Element.fromRgb255
         { red = 254
         , green = 254
         , blue = 254
@@ -1215,7 +2372,7 @@ imperfectWhite =
 
 dirtyWhite : Color
 dirtyWhite =
-    fromRgb255
+    Element.fromRgb255
         { red = 230
         , green = 230
         , blue = 230
@@ -1225,7 +2382,7 @@ dirtyWhite =
 
 imperfectBlack : Color
 imperfectBlack =
-    fromRgb255
+    Element.fromRgb255
         { red = 34
         , green = 34
         , blue = 34
@@ -1235,7 +2392,7 @@ imperfectBlack =
 
 gray : Color
 gray =
-    fromRgb255
+    Element.fromRgb255
         { red = 152
         , green = 152
         , blue = 152
@@ -1245,7 +2402,7 @@ gray =
 
 blue : Color
 blue =
-    fromRgb255
+    Element.fromRgb255
         { red = 0
         , green = 158
         , blue = 241

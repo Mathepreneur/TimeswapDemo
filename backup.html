@@ -38,7 +38,6 @@
         app.ports.sendTransaction.subscribe(object => {
             ethereum.sendAsync(object, (error, result) => {
                 app.ports.receiveTransaction.send(result)
-                console.log(result)
             })
         })      
     </script>
