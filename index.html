@@ -4,7 +4,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width,initial-scale=1.0">
-    <title>Decentralized Counter</title>
+    <title>Timeswap</title>
     <script src="main.js"></script>
 </head>
 
@@ -38,9 +38,10 @@
         app.ports.sendTransaction.subscribe(object => {
             ethereum.sendAsync(object, (error, result) => {
                 app.ports.receiveTransaction.send(result)
-                console.log(result)
             })
-        })      
+        })
+
+        app.ports.request.subscribe(ethereum.request)
     </script>
 </body>
 

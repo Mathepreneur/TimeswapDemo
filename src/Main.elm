@@ -2,6 +2,7 @@ port module Main exposing (idDecoder, main)
 
 -- IMPORT
 
+import BigInt exposing (BigInt)
 import Browser
 import Browser.Events
 import Data exposing (Address, Deposit, Loan, Reserve, UnsignedInteger)
@@ -19,6 +20,7 @@ import Json.Encode as Encode exposing (Value)
 import Network exposing (Network)
 import Sort.Dict
 import Time exposing (Posix)
+import Utility
 
 
 
@@ -60,6 +62,8 @@ type State
 
 type alias Info =
     { user : Address
+    , tokenBalance : Maybe UnsignedInteger
+    , collateralBalance : Maybe UnsignedInteger
     , tokenApproved : Maybe Approved
     , collateralApproved : Maybe Approved
     , reserve : Maybe Reserve
@@ -102,8 +106,12 @@ type Function
     = ViewReserves
     | DepositOf
     | LoanOf UnsignedInteger
+    | BalanceOfToken
+    | BalanceOfCollateral
     | AllowanceToken
     | AllowanceCollateral
+    | MintToken
+    | MintCollateral
     | ApproveToken
     | ApproveCollateral
     | Lending
@@ -163,6 +171,10 @@ type Msg
     | ChangeTokenAmount String
     | ChangeCollateralAmount String
     | ChangeInterestAmount String
+    | WatchToken
+    | WatchCollateral
+    | SendMintToken
+    | SendMintCollateral
     | Approve
     | Swap
 
@@ -210,6 +222,18 @@ update msg model =
         ( ChangeInterestAmount input, Rinkeby info ) ->
             updateInterestAmount input info model
 
+        ( WatchToken, Rinkeby _ ) ->
+            ( model, request watchToken )
+
+        ( WatchCollateral, Rinkeby _ ) ->
+            ( model, request watchCollateral )
+
+        ( SendMintToken, Rinkeby info ) ->
+            updateMintToken info model
+
+        ( SendMintCollateral, Rinkeby info ) ->
+            updateMintCollateral info model
+
         ( Approve, Rinkeby info ) ->
             updateApprove info model
 
@@ -247,9 +271,17 @@ updateConnect value model =
                         loanOfOutcome =
                             loanOf address Data.unsignedIntegerZero depositOfOutcome.log
 
+                        balanceOfTokenOutcome : Outcome
+                        balanceOfTokenOutcome =
+                            balanceOfToken address loanOfOutcome.log
+
+                        balanceOfCollateralOutcome : Outcome
+                        balanceOfCollateralOutcome =
+                            balanceOfCollateral address balanceOfTokenOutcome.log
+
                         allowanceTokenOutcome : Outcome
                         allowanceTokenOutcome =
-                            allowanceToken address loanOfOutcome.log
+                            allowanceToken address balanceOfCollateralOutcome.log
 
                         allowanceCollateralOutcome : Outcome
                         allowanceCollateralOutcome =
@@ -261,6 +293,8 @@ updateConnect value model =
                                 [ sendTransaction viewReservesOutcome.value
                                 , sendTransaction depositOfOutcome.value
                                 , sendTransaction loanOfOutcome.value
+                                , sendTransaction balanceOfTokenOutcome.value
+                                , sendTransaction balanceOfCollateralOutcome.value
                                 , sendTransaction allowanceTokenOutcome.value
                                 , sendTransaction allowanceCollateralOutcome.value
                                 ]
@@ -287,6 +321,8 @@ initialState : Address -> Log -> State
 initialState address log =
     Rinkeby
         { user = address
+        , tokenBalance = Nothing
+        , collateralBalance = Nothing
         , tokenApproved = Nothing
         , collateralApproved = Nothing
         , reserve = Nothing
@@ -538,21 +574,71 @@ updateTransaction value info model =
                 Nothing ->
                     ( model, Cmd.none )
 
-        ( Ok "2.0", Ok (Just AllowanceToken) ) ->
+        ( Ok "2.0", Ok (Just BalanceOfToken) ) ->
             let
-                resultUnsignedInteger : Maybe UnsignedInteger
+                resultUnsignedInteger : Result String UnsignedInteger
                 resultUnsignedInteger =
                     value
                         |> Decode.decodeValue unsignedIntegerDecoder
-                        |> Result.map Result.toMaybe
-                        |> Result.withDefault Nothing
+                        |> Result.withDefault (Err "Cannot turn to big int")
             in
             case resultUnsignedInteger of
-                Just unsignedInteger ->
+                Ok unsignedInteger ->
+                    let
+                        nextInfo : Info
+                        nextInfo =
+                            { info | tokenBalance = Just unsignedInteger }
+                    in
+                    ( { model | state = Rinkeby nextInfo }, Cmd.none )
+
+                _ ->
+                    let
+                        nextInfo : Info
+                        nextInfo =
+                            { info | tokenBalance = Nothing }
+                    in
+                    ( { model | state = Rinkeby nextInfo }, Cmd.none )
+
+        ( Ok "2.0", Ok (Just BalanceOfCollateral) ) ->
+            let
+                resultUnsignedInteger : Result String UnsignedInteger
+                resultUnsignedInteger =
+                    value
+                        |> Decode.decodeValue unsignedIntegerDecoder
+                        |> Result.withDefault (Err "Cannot turn to big int")
+            in
+            case resultUnsignedInteger of
+                Ok unsignedInteger ->
+                    let
+                        nextInfo : Info
+                        nextInfo =
+                            { info | collateralBalance = Just unsignedInteger }
+                    in
+                    ( { model | state = Rinkeby nextInfo }, Cmd.none )
+
+                _ ->
+                    let
+                        nextInfo : Info
+                        nextInfo =
+                            { info | tokenBalance = Nothing }
+                    in
+                    ( { model | state = Rinkeby nextInfo }, Cmd.none )
+
+        ( Ok "2.0", Ok (Just AllowanceToken) ) ->
+            let
+                resultUnsignedInteger : Result String BigInt
+                resultUnsignedInteger =
+                    value
+                        |> Decode.decodeValue unsignedIntegerDecoder
+                        |> Result.withDefault (Err "Cannot turn to big int")
+                        |> Result.andThen Data.toBigInt
+            in
+            case resultUnsignedInteger of
+                Ok unsignedInteger ->
                     let
                         tokenApproved : Approved
                         tokenApproved =
-                            if unsignedInteger == Data.unsignedIntegerMaxInteger then
+                            if BigInt.gt unsignedInteger maxUint112 then
                                 Approved
 
                             else
@@ -564,7 +650,7 @@ updateTransaction value info model =
                     in
                     ( { model | state = Rinkeby nextInfo }, Cmd.none )
 
-                Nothing ->
+                _ ->
                     let
                         nextInfo : Info
                         nextInfo =
@@ -574,19 +660,19 @@ updateTransaction value info model =
 
         ( Ok "2.0", Ok (Just AllowanceCollateral) ) ->
             let
-                resultUnsignedInteger : Maybe UnsignedInteger
+                resultUnsignedInteger : Result String BigInt
                 resultUnsignedInteger =
                     value
                         |> Decode.decodeValue unsignedIntegerDecoder
-                        |> Result.map Result.toMaybe
-                        |> Result.withDefault Nothing
+                        |> Result.withDefault (Err "Cannot turn to big int")
+                        |> Result.andThen Data.toBigInt
             in
             case resultUnsignedInteger of
-                Just unsignedInteger ->
+                Ok unsignedInteger ->
                     let
                         collateralApproved : Approved
                         collateralApproved =
-                            if unsignedInteger == Data.unsignedIntegerMaxInteger then
+                            if BigInt.gt unsignedInteger maxUint112 then
                                 Approved
 
                             else
@@ -598,7 +684,7 @@ updateTransaction value info model =
                     in
                     ( { model | state = Rinkeby nextInfo }, Cmd.none )
 
-                Nothing ->
+                _ ->
                     let
                         nextInfo : Info
                         nextInfo =
@@ -709,13 +795,13 @@ updateTokenAmount input info model =
         initialTransaction =
             info.transaction
 
-        resultToken : Result String UnsignedInteger
+        resultToken : Result String BigInt
         resultToken =
-            Data.toUnsignedIntegerFromStringToken input
+            fromTokenToBigInt input
 
-        resultCollateral : Result String UnsignedInteger
+        resultCollateral : Result String BigInt
         resultCollateral =
-            Data.toUnsignedIntegerFromStringToken initialTransaction.collateral
+            fromTokenToBigInt initialTransaction.collateral
     in
     case info.reserve of
         Just reserve ->
@@ -767,13 +853,13 @@ updateCollateralAmount input info model =
         initialTransaction =
             info.transaction
 
-        resultToken : Result String UnsignedInteger
+        resultToken : Result String BigInt
         resultToken =
-            Data.toUnsignedIntegerFromStringToken initialTransaction.token
+            fromTokenToBigInt initialTransaction.token
 
-        resultCollateral : Result String UnsignedInteger
+        resultCollateral : Result String BigInt
         resultCollateral =
-            Data.toUnsignedIntegerFromStringToken input
+            fromTokenToBigInt input
     in
     case info.reserve of
         Just reserve ->
@@ -825,13 +911,13 @@ updateInterestAmount input info model =
         initialTransaction =
             info.transaction
 
-        resultCollateral : Result String UnsignedInteger
+        resultCollateral : Result String BigInt
         resultCollateral =
-            Data.toUnsignedIntegerFromStringToken initialTransaction.collateral
+            fromTokenToBigInt initialTransaction.collateral
 
-        resultInterest : Result String UnsignedInteger
+        resultInterest : Result String BigInt
         resultInterest =
-            Data.toUnsignedIntegerFromStringToken input
+            fromTokenToBigInt input
     in
     case info.reserve of
         Just reserve ->
@@ -874,6 +960,34 @@ updateInterestAmount input info model =
 
         Nothing ->
             ( model, Cmd.none )
+
+
+updateMintToken : Info -> Model -> ( Model, Cmd Msg )
+updateMintToken info model =
+    let
+        mintTokenOutcome : Outcome
+        mintTokenOutcome =
+            mintToken info.user info.log
+
+        nextInfo : Info
+        nextInfo =
+            { info | log = mintTokenOutcome.log }
+    in
+    ( { model | state = Rinkeby nextInfo }, sendTransaction mintTokenOutcome.value )
+
+
+updateMintCollateral : Info -> Model -> ( Model, Cmd Msg )
+updateMintCollateral info model =
+    let
+        mintCollateralOutcome : Outcome
+        mintCollateralOutcome =
+            mintCollateral info.user info.log
+
+        nextInfo : Info
+        nextInfo =
+            { info | log = mintCollateralOutcome.log }
+    in
+    ( { model | state = Rinkeby nextInfo }, sendTransaction mintCollateralOutcome.value )
 
 
 updateApprove : Info -> Model -> ( Model, Cmd Msg )
@@ -957,248 +1071,296 @@ updateSwap info model =
             ( model, Cmd.none )
 
 
-getCollateralMax : UnsignedInteger -> Reserve -> Result String UnsignedInteger
+getCollateralMax : BigInt -> Reserve -> Result String BigInt
 getCollateralMax token reserve =
-    case Data.addBy token reserve.token of
-        Ok sum ->
-            token
-                |> Data.multiplyBy reserve.collateral
-                |> Result.andThen (Data.divideBy sum)
+    let
+        reserveToken : Result String BigInt
+        reserveToken =
+            reserve.token
+                |> Data.toBigInt
 
-        error ->
-            error
+        reserveCollateral : Result String BigInt
+        reserveCollateral =
+            reserve.collateral
+                |> Data.toBigInt
+
+        sum : Result String BigInt
+        sum =
+            reserveToken
+                |> Result.andThen (addBy token)
+    in
+    token
+        |> Ok
+        |> Utility.andThen2 mulBy reserveCollateral
+        |> Utility.andThen2 divBy sum
 
 
-getInterestMaxLend : UnsignedInteger -> Reserve -> Result String UnsignedInteger
+getInterestMaxLend : BigInt -> Reserve -> Result String BigInt
 getInterestMaxLend token reserve =
-    case Data.addBy token reserve.token of
-        Ok sum ->
-            token
-                |> Data.multiplyBy reserve.interest
-                |> Result.andThen (Data.divideBy sum)
+    let
+        reserveToken : Result String BigInt
+        reserveToken =
+            reserve.token
+                |> Data.toBigInt
 
-        error ->
-            error
+        reserveInterest : Result String BigInt
+        reserveInterest =
+            reserve.interest
+                |> Data.toBigInt
+
+        sum : Result String BigInt
+        sum =
+            reserveToken
+                |> Result.andThen (addBy token)
+    in
+    token
+        |> Ok
+        |> Utility.andThen2 mulBy reserveInterest
+        |> Utility.andThen2 divBy sum
 
 
-getInterestLend : UnsignedInteger -> UnsignedInteger -> Reserve -> String
+getInterestLend : BigInt -> BigInt -> Reserve -> String
 getInterestLend token collateral reserve =
-    if Data.greaterThan collateral reserve.collateral then
-        ""
+    let
+        collateralMax : Result String BigInt
+        collateralMax =
+            getCollateralMax token reserve
 
-    else
-        let
-            resultCollateralMax : Result String UnsignedInteger
-            resultCollateralMax =
-                getCollateralMax token reserve
+        interestMax : Result String BigInt
+        interestMax =
+            getInterestMaxLend token reserve
 
-            resultInterestMax : Result String UnsignedInteger
-            resultInterestMax =
-                getInterestMaxLend token reserve
-        in
-        case ( resultCollateralMax, resultInterestMax ) of
-            ( Ok collateralMax, Ok interestMax ) ->
-                if Data.greaterThan collateral collateralMax then
-                    ""
-
-                else
-                    case Data.subtractBy collateral collateralMax of
-                        Ok difference ->
-                            let
-                                resultInterest : Result String UnsignedInteger
-                                resultInterest =
-                                    interestMax
-                                        |> Data.multiplyBy difference
-                                        |> Result.andThen (Data.divideBy collateralMax)
-                            in
-                            case resultInterest of
-                                Ok interest ->
-                                    Data.fromUnsignedIntegerToToken interest
-
-                                _ ->
-                                    ""
-
-                        _ ->
-                            ""
-
-            _ ->
-                ""
+        difference : Result String BigInt
+        difference =
+            collateralMax
+                |> Result.andThen (subBy collateral)
+    in
+    interestMax
+        |> Utility.andThen2 mulBy difference
+        |> Utility.andThen2 divBy collateralMax
+        |> Result.andThen fromBigIntToToken
+        |> Result.withDefault ""
 
 
-getCollateralMin : UnsignedInteger -> Reserve -> Result String UnsignedInteger
+getCollateralMin : BigInt -> Reserve -> Result String BigInt
 getCollateralMin token reserve =
-    case Data.subtractBy token reserve.token of
-        Ok difference ->
-            token
-                |> Data.multiplyBy reserve.collateral
-                |> Result.andThen (Data.divideBy difference)
+    let
+        reserveToken : Result String BigInt
+        reserveToken =
+            reserve.token
+                |> Data.toBigInt
 
-        error ->
-            error
+        reserveCollateral : Result String BigInt
+        reserveCollateral =
+            reserve.collateral
+                |> Data.toBigInt
+
+        difference : Result String BigInt
+        difference =
+            reserveToken
+                |> Result.andThen (subBy token)
+    in
+    token
+        |> Ok
+        |> Utility.andThen2 mulBy reserveCollateral
+        |> Utility.andThen2 divBy difference
 
 
-getInterestMaxBorrow : UnsignedInteger -> Reserve -> Result String UnsignedInteger
+getInterestMaxBorrow : BigInt -> Reserve -> Result String BigInt
 getInterestMaxBorrow token reserve =
-    case Data.subtractBy token reserve.token of
-        Ok difference ->
-            token
-                |> Data.multiplyBy reserve.interest
-                |> Result.andThen (Data.divideBy difference)
+    let
+        reserveToken : Result String BigInt
+        reserveToken =
+            reserve.token
+                |> Data.toBigInt
 
-        error ->
-            error
+        reserveInterest : Result String BigInt
+        reserveInterest =
+            reserve.interest
+                |> Data.toBigInt
+
+        difference : Result String BigInt
+        difference =
+            reserveToken
+                |> Result.andThen (subBy token)
+    in
+    token
+        |> Ok
+        |> Utility.andThen2 mulBy reserveInterest
+        |> Utility.andThen2 divBy difference
 
 
-getInterestBorrow : UnsignedInteger -> UnsignedInteger -> Reserve -> String
+getInterestBorrow : BigInt -> BigInt -> Reserve -> String
 getInterestBorrow token collateral reserve =
-    if Data.greaterThan token reserve.token then
-        ""
+    let
+        collateralMin : Result String BigInt
+        collateralMin =
+            getCollateralMin token reserve
 
-    else
-        let
-            resultCollateralMin : Result String UnsignedInteger
-            resultCollateralMin =
-                getCollateralMin token reserve
+        interestMax : Result String BigInt
+        interestMax =
+            getInterestMaxBorrow token reserve
 
-            resultInterestMax : Result String UnsignedInteger
-            resultInterestMax =
-                getInterestMaxBorrow token reserve
-        in
-        case ( resultCollateralMin, resultInterestMax ) of
-            ( Ok collateralMin, Ok interestMax ) ->
-                if Data.greaterThan collateralMin collateral then
-                    ""
+        checkedCollateral : Result String BigInt
+        checkedCollateral =
+            if Result.withDefault False (Result.map2 BigInt.gte (Ok collateral) collateralMin) then
+                Ok collateral
 
-                else
-                    let
-                        resultInterest : Result String UnsignedInteger
-                        resultInterest =
-                            interestMax
-                                |> Data.multiplyBy collateralMin
-                                |> Result.andThen (Data.divideBy collateral)
-                    in
-                    case resultInterest of
-                        Ok interest ->
-                            Data.fromUnsignedIntegerToToken interest
-
-                        _ ->
-                            ""
-
-            _ ->
-                ""
+            else
+                Err "Collateral must be greeater than minimum"
+    in
+    interestMax
+        |> Utility.andThen2 mulBy collateralMin
+        |> Utility.andThen2 divBy checkedCollateral
+        |> Result.andThen fromBigIntToToken
+        |> Result.withDefault ""
 
 
-getTokenLend : UnsignedInteger -> UnsignedInteger -> Reserve -> String
+getTokenLend : BigInt -> BigInt -> Reserve -> String
 getTokenLend collateral interest reserve =
-    if Data.greaterThan collateral reserve.collateral then
-        ""
+    let
+        reserveToken : Result String BigInt
+        reserveToken =
+            reserve.token
+                |> Data.toBigInt
 
-    else
-        let
-            resultFirst : Result String UnsignedInteger
-            resultFirst =
-                collateral
-                    |> Data.multiplyBy reserve.interest
+        reserveCollateral : Result String BigInt
+        reserveCollateral =
+            reserve.collateral
+                |> Data.toBigInt
 
-            resultSecond : Result String UnsignedInteger
-            resultSecond =
-                interest
-                    |> Data.multiplyBy reserve.collateral
+        reserveInterest : Result String BigInt
+        reserveInterest =
+            reserve.interest
+                |> Data.toBigInt
 
-            resultThird : Result String UnsignedInteger
-            resultThird =
-                reserve.collateral
-                    |> Data.multiplyBy reserve.interest
-        in
-        case ( resultFirst, resultSecond, resultThird ) of
-            ( Ok first, Ok second, Ok third ) ->
-                let
-                    resultW : Result String UnsignedInteger
-                    resultW =
-                        first
-                            |> Data.addBy second
-                            |> Result.andThen (Data.divideBy third)
-                in
-                case resultW of
-                    Ok w ->
-                        if w == Data.unsignedIntegerZero then
-                            ""
+        first : Result String BigInt
+        first =
+            collateral
+                |> Ok
+                |> Utility.andThen2 mulBy reserveInterest
 
-                        else
-                            case Data.subtractBy w Data.unsignedIntegerTokenOne of
-                                Ok difference ->
-                                    let
-                                        resultToken : Result String UnsignedInteger
-                                        resultToken =
-                                            w
-                                                |> Data.multiplyBy reserve.token
-                                                |> Result.andThen (Data.divideBy difference)
-                                    in
-                                    case resultToken of
-                                        Ok token ->
-                                            Data.fromUnsignedIntegerToToken token
+        second : Result String BigInt
+        second =
+            interest
+                |> Ok
+                |> Utility.andThen2 mulBy reserveCollateral
 
-                                        _ ->
-                                            ""
+        denominator : Result String BigInt
+        denominator =
+            reserveCollateral
+                |> Utility.andThen2 mulBy reserveInterest
 
-                                _ ->
-                                    ""
+        quotient : Result String BigInt
+        quotient =
+            first
+                |> Utility.andThen2 addBy second
+                |> Utility.andThen2 mulBy (Ok quintillion)
+                |> Utility.andThen2 divBy denominator
 
-                    _ ->
-                        ""
-
-            _ ->
-                ""
+        difference : Result String BigInt
+        difference =
+            quintillion
+                |> Ok
+                |> Utility.andThen2 subBy quotient
+    in
+    quotient
+        |> Utility.andThen2 mulBy reserveToken
+        |> Utility.andThen2 divBy difference
+        |> Result.andThen fromBigIntToToken
+        |> Result.withDefault ""
 
 
-getTokenBorrow : UnsignedInteger -> UnsignedInteger -> Reserve -> String
+getTokenBorrow : BigInt -> BigInt -> Reserve -> String
 getTokenBorrow collateral interest reserve =
     let
-        resultDenominator : Result String UnsignedInteger
-        resultDenominator =
+        reserveToken : Result String BigInt
+        reserveToken =
+            reserve.token
+                |> Data.toBigInt
+
+        reserveCollateral : Result String BigInt
+        reserveCollateral =
             reserve.collateral
-                |> Data.multiplyBy reserve.interest
+                |> Data.toBigInt
+
+        reserveInterest : Result String BigInt
+        reserveInterest =
+            reserve.interest
+                |> Data.toBigInt
+
+        denominator : Result String BigInt
+        denominator =
+            reserveCollateral
+                |> Utility.andThen2 mulBy reserveInterest
+
+        quotient : Result String BigInt
+        quotient =
+            collateral
+                |> mulBy interest
+                |> Utility.andThen2 mulBy (Ok quintillion)
+                |> Utility.andThen2 divBy denominator
+                |> Result.andThen squareRoot
+
+        sum : Result String BigInt
+        sum =
+            quintillion
+                |> Ok
+                |> Utility.andThen2 addBy quotient
     in
-    case resultDenominator of
-        Ok denominator ->
-            let
-                resultW : Result String UnsignedInteger
-                resultW =
-                    collateral
-                        |> Data.multiplyBy interest
-                        |> Result.andThen (Data.divideBy denominator)
-                        |> Result.andThen Data.squareRoot
-            in
-            case resultW of
-                Ok w ->
-                    if w == Data.unsignedIntegerZero then
-                        ""
+    quotient
+        |> Utility.andThen2 mulBy reserveToken
+        |> Utility.andThen2 divBy sum
+        |> Result.andThen fromBigIntToToken
+        |> Result.withDefault ""
 
-                    else
-                        case Data.addBy w Data.unsignedIntegerTokenOne of
-                            Ok sum ->
-                                let
-                                    resultToken : Result String UnsignedInteger
-                                    resultToken =
-                                        w
-                                            |> Data.multiplyBy reserve.token
-                                            |> Result.andThen (Data.divideBy sum)
-                                in
-                                case resultToken of
-                                    Ok token ->
-                                        Data.fromUnsignedIntegerToToken token
 
-                                    _ ->
-                                        ""
+watchToken : Value
+watchToken =
+    let
+        parameter : Value
+        parameter =
+            Encode.object
+                [ ( "type", tokenERC20Encode )
+                , ( "options", options )
+                ]
 
-                            _ ->
-                                ""
+        options : Value
+        options =
+            Encode.object
+                [ ( "address", Data.addressEncode Data.addressDaiTSDemo )
+                , ( "symbol", tokenEncode )
+                , ( "decimals", decimalsEncode )
+                ]
+    in
+    Encode.object
+        [ ( "method", method2Encode )
+        , ( "params", parameter )
+        ]
 
-                _ ->
-                    ""
 
-        _ ->
-            ""
+watchCollateral : Value
+watchCollateral =
+    let
+        parameter : Value
+        parameter =
+            Encode.object
+                [ ( "type", tokenERC20Encode )
+                , ( "options", options )
+                ]
+
+        options : Value
+        options =
+            Encode.object
+                [ ( "address", Data.addressEncode Data.addressFileTSDemo )
+                , ( "symbol", collateralEncode )
+                , ( "decimals", decimalsEncode )
+                ]
+    in
+    Encode.object
+        [ ( "method", method2Encode )
+        , ( "params", parameter )
+        ]
 
 
 viewReserves : Log -> Outcome
@@ -1276,6 +1438,56 @@ loanOf owner index log =
     Outcome value nextLog
 
 
+balanceOfToken : Address -> Log -> Outcome
+balanceOfToken owner log =
+    let
+        parameter : List ( String, Value )
+        parameter =
+            [ ( "to", Data.addressEncode Data.addressDaiTSDemo )
+            , ( "data", Data.encode <| Data.balanceOf owner )
+            ]
+
+        nextLog : Log
+        nextLog =
+            next BalanceOfToken log
+
+        value : Value
+        value =
+            Encode.object
+                [ ( "id", idEncode nextLog )
+                , ( "jsonrpc", jsonrpcEncode )
+                , ( "method", methodEncode Call )
+                , ( "params", parameterEncode parameter )
+                ]
+    in
+    Outcome value nextLog
+
+
+balanceOfCollateral : Address -> Log -> Outcome
+balanceOfCollateral owner log =
+    let
+        parameter : List ( String, Value )
+        parameter =
+            [ ( "to", Data.addressEncode Data.addressFileTSDemo )
+            , ( "data", Data.encode <| Data.balanceOf owner )
+            ]
+
+        nextLog : Log
+        nextLog =
+            next BalanceOfCollateral log
+
+        value : Value
+        value =
+            Encode.object
+                [ ( "id", idEncode nextLog )
+                , ( "jsonrpc", jsonrpcEncode )
+                , ( "method", methodEncode Call )
+                , ( "params", parameterEncode parameter )
+                ]
+    in
+    Outcome value nextLog
+
+
 allowanceToken : Address -> Log -> Outcome
 allowanceToken owner log =
     let
@@ -1320,6 +1532,58 @@ allowanceCollateral owner log =
                 [ ( "id", idEncode nextLog )
                 , ( "jsonrpc", jsonrpcEncode )
                 , ( "method", methodEncode Call )
+                , ( "params", parameterEncode parameter )
+                ]
+    in
+    Outcome value nextLog
+
+
+mintToken : Address -> Log -> Outcome
+mintToken sender log =
+    let
+        parameter : List ( String, Value )
+        parameter =
+            [ ( "from", Data.addressEncode sender )
+            , ( "to", Data.addressEncode Data.addressDaiTSDemo )
+            , ( "data", Data.encode <| Data.mint sender Data.mintTokenAmount )
+            ]
+
+        nextLog : Log
+        nextLog =
+            next MintToken log
+
+        value : Value
+        value =
+            Encode.object
+                [ ( "id", idEncode nextLog )
+                , ( "jsonrpc", jsonrpcEncode )
+                , ( "method", methodEncode SendTransaction )
+                , ( "params", parameterEncode parameter )
+                ]
+    in
+    Outcome value nextLog
+
+
+mintCollateral : Address -> Log -> Outcome
+mintCollateral sender log =
+    let
+        parameter : List ( String, Value )
+        parameter =
+            [ ( "from", Data.addressEncode sender )
+            , ( "to", Data.addressEncode Data.addressFileTSDemo )
+            , ( "data", Data.encode <| Data.mint sender Data.mintCollateralAmount )
+            ]
+
+        nextLog : Log
+        nextLog =
+            next MintCollateral log
+
+        value : Value
+        value =
+            Encode.object
+                [ ( "id", idEncode nextLog )
+                , ( "jsonrpc", jsonrpcEncode )
+                , ( "method", methodEncode SendTransaction )
                 , ( "params", parameterEncode parameter )
                 ]
     in
@@ -1471,6 +1735,31 @@ parameterEncode parameter =
     Encode.list Encode.object <| List.singleton parameter
 
 
+method2Encode : Value
+method2Encode =
+    Encode.string "wallet_watchAsset"
+
+
+tokenERC20Encode : Value
+tokenERC20Encode =
+    Encode.string "ERC20"
+
+
+tokenEncode : Value
+tokenEncode =
+    Encode.string "DAI"
+
+
+collateralEncode : Value
+collateralEncode =
+    Encode.string "FILE"
+
+
+decimalsEncode : Value
+decimalsEncode =
+    Encode.int 18
+
+
 
 -- SUBSCRIPTIONS
 
@@ -1507,6 +1796,9 @@ port sendConnect : () -> Cmd msg
 port sendTransaction : Value -> Cmd msg
 
 
+port request : Value -> Cmd msg
+
+
 port receiveConnect : (Value -> msg) -> Sub msg
 
 
@@ -1525,9 +1817,36 @@ port receiveTransaction : (Value -> msg) -> Sub msg
 
 view : Model -> Html Msg
 view model =
+    let
+        viewHeader : Element Msg
+        viewHeader =
+            case model.state of
+                Rinkeby info ->
+                    viewHeaderConnected info.user
+
+                NotConnected ->
+                    viewHeaderNotConnected
+
+                NoMetamask ->
+                    Element.none
+
+        viewFooter : Element Msg
+        viewFooter =
+            case model.state of
+                Rinkeby _ ->
+                    viewFooterConnected
+
+                NotConnected ->
+                    Element.none
+
+                NoMetamask ->
+                    Element.none
+    in
     Element.layoutWith
         { options = [ Element.focusStyle focus ] }
-        []
+        [ Element.inFront viewHeader
+        , Element.inFront viewFooter
+        ]
         (viewElement model)
 
 
@@ -1543,31 +1862,24 @@ viewElement : Model -> Element Msg
 viewElement model =
     case model.state of
         Rinkeby info ->
-            Element.column
+            Element.el
                 [ Element.width Element.fill
                 , Element.height Element.fill
                 , Background.color imperfectWhite
                 ]
-                [ viewHeader info.user
-                , viewBody info
-                ]
+            <|
+                viewBody info
 
         NotConnected ->
-            Element.column
+            Element.el
                 [ Element.width Element.fill
                 , Element.height Element.fill
                 , Background.color imperfectWhite
                 ]
-                [ viewHeaderNotConnected
-                , Element.none -- Add More
-                ]
+                viewBodyNotConnected
 
         NoMetamask ->
-            Element.none
-
-
-
--- Add More
+            viewBodyNoMetamask
 
 
 viewHeaderNotConnected : Element Msg
@@ -1598,8 +1910,8 @@ viewWalletNotConnected =
         }
 
 
-viewHeader : Address -> Element Msg
-viewHeader address =
+viewHeaderConnected : Address -> Element Msg
+viewHeaderConnected address =
     Element.row
         [ Element.width Element.fill
         , Element.height <| Element.px 72
@@ -1633,18 +1945,142 @@ viewWallet address =
         (Data.fromAddressToTextShort address)
 
 
+viewFooterConnected : Element Msg
+viewFooterConnected =
+    Element.row
+        [ Element.width Element.fill
+        , Element.height <| Element.px 72
+        , Element.padding 12
+        , Element.spacing 12
+        , Element.alignBottom
+        ]
+        [ viewMintToken
+        , viewWatchToken
+        , viewMintCollateral
+        , viewWatchCollateral
+        , viewEmail
+        ]
+
+
+viewMintToken : Element Msg
+viewMintToken =
+    Input.button
+        [ Element.paddingXY 18 9
+        , Element.alignLeft
+        , Background.color blue
+        , Border.rounded 30
+        , Font.color imperfectWhite
+        , Font.size 18
+        , Font.family lato
+        ]
+        { onPress = Just SendMintToken
+        , label = Element.text "Mint 1000 Test DAI"
+        }
+
+
+viewWatchToken : Element Msg
+viewWatchToken =
+    Input.button
+        [ Element.paddingXY 18 9
+        , Element.alignLeft
+        , Background.color blue
+        , Border.rounded 30
+        , Font.color imperfectWhite
+        , Font.size 18
+        , Font.family lato
+        ]
+        { onPress = Just WatchToken
+        , label = Element.text "Show Test DAI in Metamask"
+        }
+
+
+viewMintCollateral : Element Msg
+viewMintCollateral =
+    Input.button
+        [ Element.paddingXY 18 9
+        , Element.alignLeft
+        , Background.color blue
+        , Border.rounded 30
+        , Font.color imperfectWhite
+        , Font.size 18
+        , Font.family lato
+        ]
+        { onPress = Just SendMintCollateral
+        , label = Element.text "Mint 5 Test FILE"
+        }
+
+
+viewWatchCollateral : Element Msg
+viewWatchCollateral =
+    Input.button
+        [ Element.paddingXY 18 9
+        , Element.alignLeft
+        , Background.color blue
+        , Border.rounded 30
+        , Font.color imperfectWhite
+        , Font.size 18
+        , Font.family lato
+        ]
+        { onPress = Just WatchCollateral
+        , label = Element.text "Show Test FILE in Metamask"
+        }
+
+
+
+viewEmail : Element Msg
+viewEmail =
+    Element.el
+        [ Element.paddingXY 18 9
+        , Element.alignRight
+        , Background.color blue
+        , Border.rounded 30
+        , Font.color imperfectWhite
+        , Font.size 18
+        , Font.family lato
+        ]
+        (Element.text "Mathepreneur.eth@gmail.com")
+
+
 viewBody : Info -> Element Msg
 viewBody info =
     Element.row
         [ Element.width Element.fill
         , Element.height Element.fill
-        , Element.paddingXY 20 100
+        , Element.paddingXY 20 172
         , Element.spacing 20
         ]
-        [ viewAsset info.deposit
-        , viewLiability info.loan
+        [ viewAssetBox info.deposit
         , viewSwap info
+        , viewLiabilityBox info.loan
         ]
+
+
+viewBodyNotConnected : Element Msg
+viewBodyNotConnected =
+    Element.paragraph
+        [ Element.width Element.fill
+        , Element.padding 100
+        , Element.centerY
+        , Font.color blue
+        , Font.size 48
+        , Font.family lato
+        , Font.center
+        ]
+        [ Element.text "Connect to Metamask Rinkeby Test Network." ]
+
+
+viewBodyNoMetamask : Element Msg
+viewBodyNoMetamask =
+    Element.paragraph
+        [ Element.width Element.fill
+        , Element.padding 100
+        , Element.centerY
+        , Font.color blue
+        , Font.size 48
+        , Font.family lato
+        , Font.center
+        ]
+        [ Element.text "Timeswap Demo requires Metamask." ]
 
 
 viewSwap : Info -> Element Msg
@@ -1665,7 +2101,7 @@ viewSwap info =
                 , viewInsurance info.transaction.token info.transaction.collateral info.reserve
                 , viewInterest info.transaction.token info.transaction.interest
                 , viewApproveButton info.tokenApproved
-                , viewSwapButton info.tokenApproved info.transaction
+                , viewSwapButton info.tokenBalance info.collateralBalance info.tokenApproved info.transaction
                 ]
 
         Borrow ->
@@ -1683,7 +2119,7 @@ viewSwap info =
                 , viewCollateral info.transaction.token info.transaction.collateral info.reserve
                 , viewInterest info.transaction.token info.transaction.interest
                 , viewApproveButton info.collateralApproved
-                , viewSwapButton info.collateralApproved info.transaction
+                , viewSwapButton info.tokenBalance info.collateralBalance info.collateralApproved info.transaction
                 ]
 
 
@@ -1729,7 +2165,7 @@ viewLendTabChosen : Element Msg
 viewLendTabChosen =
     Input.button
         [ Element.width Element.fill
-        , Font.color imperfectBlack
+        , Font.color blue
         , Font.size 24
         , Font.family lato
         , Font.center
@@ -1757,7 +2193,7 @@ viewBorrowTabChosen : Element Msg
 viewBorrowTabChosen =
     Input.button
         [ Element.width Element.fill
-        , Font.color imperfectBlack
+        , Font.color blue
         , Font.size 24
         , Font.family lato
         , Font.center
@@ -1790,7 +2226,7 @@ viewInsurance token collateral maybeReserve =
         , Background.color imperfectWhite
         , Border.rounded 30
         ]
-        [ viewInputInsuranceDetails <| unsignedIntegerToString <| getCollateralMaxMaybe (Data.toUnsignedIntegerFromStringToken token) maybeReserve
+        [ viewInputInsuranceDetails <| getInsuranceDetails token maybeReserve
         , viewInput collateral "FILE" ChangeCollateralAmount
         ]
 
@@ -1804,29 +2240,27 @@ viewCollateral token collateral maybeReserve =
         , Background.color imperfectWhite
         , Border.rounded 30
         ]
-        [ viewInputCollateralDetails <| unsignedIntegerToString <| getCollateralMinMaybe (Data.toUnsignedIntegerFromStringToken token) maybeReserve
+        [ viewInputCollateralDetails <| getCollateralDetails token maybeReserve
         , viewInput collateral "FILE" ChangeCollateralAmount
         ]
 
 
-getCollateralMaxMaybe : Result String UnsignedInteger -> Maybe Reserve -> Result String UnsignedInteger
-getCollateralMaxMaybe resultToken maybeReserve =
-    case ( resultToken, maybeReserve ) of
-        ( Ok token, Just reserve ) ->
-            getCollateralMax token reserve
+getInsuranceDetails : String -> Maybe Reserve -> Maybe String
+getInsuranceDetails token maybeReserve =
+    maybeReserve
+        |> Result.fromMaybe "No reserves"
+        |> Utility.andThen2 getCollateralMax (fromTokenToBigInt token)
+        |> Result.andThen fromBigIntToToken
+        |> Result.toMaybe
 
-        _ ->
-            Err "No Reserve"
 
-
-getCollateralMinMaybe : Result String UnsignedInteger -> Maybe Reserve -> Result String UnsignedInteger
-getCollateralMinMaybe resultToken maybeReserve =
-    case ( resultToken, maybeReserve ) of
-        ( Ok token, Just reserve ) ->
-            getCollateralMin token reserve
-
-        _ ->
-            Err "No Reserve"
+getCollateralDetails : String -> Maybe Reserve -> Maybe String
+getCollateralDetails token maybeReserve =
+    maybeReserve
+        |> Result.fromMaybe "No reserve"
+        |> Utility.andThen2 getCollateralMin (fromTokenToBigInt token)
+        |> Result.andThen fromBigIntToToken
+        |> Result.toMaybe
 
 
 unsignedIntegerToString : Result String UnsignedInteger -> Maybe String
@@ -2104,38 +2538,146 @@ viewApproveButton approved =
             Element.none
 
 
-viewSwapButton : Maybe Approved -> Transaction -> Element Msg
-viewSwapButton approved transaction =
+viewSwapButton : Maybe UnsignedInteger -> Maybe UnsignedInteger -> Maybe Approved -> Transaction -> Element Msg
+viewSwapButton tokenBalance collateralBalance approved transaction =
     case approved of
         Just Approved ->
             let
                 resultToken : Result String UnsignedInteger
                 resultToken =
-                    Data.toUnsignedIntegerFromStringToken transaction.token
+                    transaction.token
+                        |> Data.toUnsignedIntegerFromStringToken
+
+                resultTokenBigInt : Result String BigInt
+                resultTokenBigInt =
+                    transaction.token
+                        |> fromTokenToBigInt
 
                 resultCollateral : Result String UnsignedInteger
                 resultCollateral =
-                    Data.toUnsignedIntegerFromStringToken transaction.collateral
+                    transaction.collateral
+                        |> Data.toUnsignedIntegerFromStringToken
+
+                resultCollateralBigInt : Result String BigInt
+                resultCollateralBigInt =
+                    transaction.collateral
+                        |> fromTokenToBigInt
 
                 resultInterest : Result String UnsignedInteger
                 resultInterest =
-                    Data.toUnsignedIntegerFromStringToken transaction.interest
+                    transaction.interest
+                        |> Data.toUnsignedIntegerFromStringToken
+
+                resultTokenBalance : Result String BigInt
+                resultTokenBalance =
+                    tokenBalance
+                        |> Result.fromMaybe "Has not acquired balance"
+                        |> Result.andThen Data.toBigInt
+
+                resultCollateralBalance : Result String BigInt
+                resultCollateralBalance =
+                    collateralBalance
+                        |> Result.fromMaybe "Has not acquired balance"
+                        |> Result.andThen Data.toBigInt
             in
             case ( resultToken, resultCollateral, resultInterest ) of
                 ( Ok _, Ok _, Ok _ ) ->
-                    Input.button
-                        [ Element.width Element.fill
-                        , Element.padding 12
-                        , Background.color blue
-                        , Border.rounded 30
-                        , Font.color imperfectWhite
-                        , Font.size 24
-                        , Font.family lato
-                        , Font.center
-                        ]
-                        { onPress = Just Swap
-                        , label = Element.text "Swap"
-                        }
+                    case transaction.transactionType of
+                        Lend ->
+                            case ( resultTokenBalance, resultTokenBigInt ) of
+                                ( Ok currentTokenBalance, Ok tokenBigInt ) ->
+                                    if BigInt.gte currentTokenBalance tokenBigInt then
+                                        Input.button
+                                            [ Element.width Element.fill
+                                            , Element.padding 12
+                                            , Background.color blue
+                                            , Border.rounded 30
+                                            , Font.color imperfectWhite
+                                            , Font.size 24
+                                            , Font.family lato
+                                            , Font.center
+                                            ]
+                                            { onPress = Just Swap
+                                            , label = Element.text "Swap"
+                                            }
+
+                                    else
+                                        Input.button
+                                            [ Element.width Element.fill
+                                            , Element.padding 12
+                                            , Background.color blue
+                                            , Border.rounded 30
+                                            , Font.color imperfectWhite
+                                            , Font.size 24
+                                            , Font.family lato
+                                            , Font.center
+                                            ]
+                                            { onPress = Nothing
+                                            , label = Element.text "Not Enough Funds"
+                                            }
+
+                                _ ->
+                                    Input.button
+                                        [ Element.width Element.fill
+                                        , Element.padding 12
+                                        , Background.color gray
+                                        , Border.rounded 30
+                                        , Font.color imperfectWhite
+                                        , Font.size 24
+                                        , Font.family lato
+                                        , Font.center
+                                        ]
+                                        { onPress = Nothing
+                                        , label = Element.text "Enter an Amount"
+                                        }
+
+                        Borrow ->
+                            case ( resultCollateralBalance, resultCollateralBigInt ) of
+                                ( Ok currentCollateralBalance, Ok collateralBigInt ) ->
+                                    if BigInt.gte currentCollateralBalance collateralBigInt then
+                                        Input.button
+                                            [ Element.width Element.fill
+                                            , Element.padding 12
+                                            , Background.color blue
+                                            , Border.rounded 30
+                                            , Font.color imperfectWhite
+                                            , Font.size 24
+                                            , Font.family lato
+                                            , Font.center
+                                            ]
+                                            { onPress = Just Swap
+                                            , label = Element.text "Swap"
+                                            }
+
+                                    else
+                                        Input.button
+                                            [ Element.width Element.fill
+                                            , Element.padding 12
+                                            , Background.color blue
+                                            , Border.rounded 30
+                                            , Font.color imperfectWhite
+                                            , Font.size 24
+                                            , Font.family lato
+                                            , Font.center
+                                            ]
+                                            { onPress = Nothing
+                                            , label = Element.text "Not Enough Funds"
+                                            }
+
+                                _ ->
+                                    Input.button
+                                        [ Element.width Element.fill
+                                        , Element.padding 12
+                                        , Background.color gray
+                                        , Border.rounded 30
+                                        , Font.color imperfectWhite
+                                        , Font.size 24
+                                        , Font.family lato
+                                        , Font.center
+                                        ]
+                                        { onPress = Nothing
+                                        , label = Element.text "Enter an Amount"
+                                        }
 
                 _ ->
                     Input.button
@@ -2172,6 +2714,16 @@ viewSwapButton approved transaction =
 -- VIEW ASSET
 
 
+viewAssetBox : Maybe Deposit -> Element Msg
+viewAssetBox maybeDeposit =
+    Element.el
+        [ Element.width Element.fill
+        , Element.height Element.fill
+        ]
+    <|
+        viewAsset maybeDeposit
+
+
 viewAsset : Maybe Deposit -> Element Msg
 viewAsset maybeDeposit =
     case maybeDeposit of
@@ -2187,7 +2739,7 @@ viewAsset maybeDeposit =
                     [ Element.width <| Element.px 400
                     , Element.padding 20
                     , Element.spacing 20
-                    , Element.centerX
+                    , Element.alignRight
                     , Element.alignTop
                     , Background.color dirtyWhite
                     , Border.rounded 30
@@ -2201,14 +2753,37 @@ viewAsset maybeDeposit =
 
 viewDepositTitle : Element Msg
 viewDepositTitle =
+    Element.column
+        [ Element.width Element.fill
+        , Element.spacing 5
+        ]
+        [ viewDepositText
+        , viewDepositMaturity
+        ]
+
+
+viewDepositText : Element Msg
+viewDepositText =
     Element.el
         [ Element.width Element.fill
-        , Font.color gray
+        , Font.color blue
         , Font.size 24
         , Font.family lato
         , Font.center
         ]
         (Element.text "Deposit")
+
+
+viewDepositMaturity : Element Msg
+viewDepositMaturity =
+    Element.el
+        [ Element.width Element.fill
+        , Font.color gray
+        , Font.size 12
+        , Font.family lato
+        , Font.center
+        ]
+        (Element.text "August 5, 2021")
 
 
 viewDepositBox : Deposit -> Element Msg
@@ -2259,6 +2834,16 @@ viewDepositInsurance insurance =
 -- VIEW LIABILITY LIST
 
 
+viewLiabilityBox : Sort.Dict.Dict UnsignedInteger Loan -> Element Msg
+viewLiabilityBox dictionaryLoan =
+    Element.el
+        [ Element.width Element.fill
+        , Element.height Element.fill
+        ]
+    <|
+        viewLiability dictionaryLoan
+
+
 viewLiability : Sort.Dict.Dict UnsignedInteger Loan -> Element Msg
 viewLiability dictionaryLoan =
     if dictionaryLoan == Sort.Dict.empty Data.sorter then
@@ -2269,7 +2854,7 @@ viewLiability dictionaryLoan =
             [ Element.width <| Element.px 400
             , Element.padding 20
             , Element.spacing 20
-            , Element.centerX
+            , Element.alignLeft
             , Element.alignTop
             , Background.color dirtyWhite
             , Border.rounded 30
@@ -2281,14 +2866,37 @@ viewLiability dictionaryLoan =
 
 viewDebtTitle : Element Msg
 viewDebtTitle =
+    Element.column
+        [ Element.width Element.fill
+        , Element.spacing 5
+        ]
+        [ viewDebtText
+        , viewDebtMaturity
+        ]
+
+
+viewDebtText : Element Msg
+viewDebtText =
     Element.el
         [ Element.width Element.fill
-        , Font.color gray
+        , Font.color blue
         , Font.size 24
         , Font.family lato
         , Font.center
         ]
         (Element.text "Debt")
+
+
+viewDebtMaturity : Element Msg
+viewDebtMaturity =
+    Element.el
+        [ Element.width Element.fill
+        , Font.color gray
+        , Font.size 12
+        , Font.family lato
+        , Font.center
+        ]
+        (Element.text "August 5, 2021")
 
 
 viewLoanBox : Loan -> Element Msg
@@ -2408,3 +3016,185 @@ blue =
         , blue = 241
         , alpha = 1
         }
+
+
+
+-- BIG INT
+
+
+quintillion : BigInt
+quintillion =
+    "1000000000000000000"
+        |> BigInt.fromIntString
+        |> Maybe.withDefault zero
+
+
+fromTokenToBigInt : String -> Result String BigInt
+fromTokenToBigInt string =
+    let
+        splits : List String
+        splits =
+            string
+                |> String.split "."
+
+        whole : String -> Result String BigInt
+        whole wholeString =
+            wholeString
+                |> BigInt.fromIntString
+                |> Result.fromMaybe "Not able to turn to big int"
+                |> Result.map (BigInt.mul quintillion)
+
+        decimal : String -> Result String BigInt
+        decimal decimalString =
+            let
+                decimalLength : Int
+                decimalLength =
+                    decimalString
+                        |> String.length
+            in
+            if decimalLength <= 18 then
+                decimalString
+                    |> String.padRight 18 '0'
+                    |> BigInt.fromIntString
+                    |> Result.fromMaybe "Not able to turn to big int"
+
+            else
+                decimalString
+                    |> String.left 18
+                    |> BigInt.fromIntString
+                    |> Result.fromMaybe "Not able to turn to big int"
+    in
+    case splits of
+        [] ->
+            Err "Cannot be empty string"
+
+        big :: [] ->
+            whole big
+
+        big :: small :: [] ->
+            small
+                |> decimal
+                |> Result.map2 BigInt.add (whole big)
+                |> Result.andThen checkSize
+
+        _ ->
+            Err "Cannot be unsignedInteger"
+
+
+fromBigIntToToken : BigInt -> Result String String
+fromBigIntToToken bigInt =
+    let
+        division : Result String ( BigInt, BigInt )
+        division =
+            BigInt.divmod bigInt quintillion
+                |> Result.fromMaybe "cannot be turn to string"
+
+        quotient : Result String String
+        quotient =
+            division
+                |> Result.map Tuple.first
+                |> Result.map BigInt.toString
+
+        remainder : Result String String
+        remainder =
+            division
+                |> Result.map Tuple.second
+                |> Result.map BigInt.toString
+
+        combine : String -> String -> String
+        combine whole decimal =
+            case ( whole, decimal ) of
+                ( "0", "0" ) ->
+                    "0"
+
+                ( notZero, "0" ) ->
+                    notZero
+
+                ( "0", notZero ) ->
+                    notZero
+                        |> String.padLeft 18 '0'
+                        |> (++) "0."
+
+                _ ->
+                    decimal
+                        |> String.padLeft 18 '0'
+                        |> (++) "."
+                        |> (++) whole
+    in
+    Result.map2 combine quotient remainder
+
+
+zero : BigInt
+zero =
+    0
+        |> BigInt.fromInt
+
+
+maxUint256 : BigInt
+maxUint256 =
+    BigInt.sub (BigInt.pow (BigInt.fromInt 2) (BigInt.fromInt 256)) (BigInt.fromInt 1)
+
+
+maxUint112 : BigInt
+maxUint112 =
+    BigInt.sub (BigInt.pow (BigInt.fromInt 2) (BigInt.fromInt 112)) (BigInt.fromInt 1)
+
+
+checkSize : BigInt -> Result String BigInt
+checkSize bigInt =
+    if BigInt.gt bigInt maxUint256 then
+        Err "Overflow"
+
+    else if BigInt.lt bigInt zero then
+        Err "Overflow"
+
+    else
+        Ok bigInt
+
+
+addBy : BigInt -> BigInt -> Result String BigInt
+addBy bigInt1 bigInt2 =
+    BigInt.add bigInt2 bigInt1
+        |> checkSize
+
+
+subBy : BigInt -> BigInt -> Result String BigInt
+subBy bigInt1 bigInt2 =
+    BigInt.sub bigInt2 bigInt1
+        |> checkSize
+
+
+mulBy : BigInt -> BigInt -> Result String BigInt
+mulBy bigInt1 bigInt2 =
+    BigInt.mul bigInt2 bigInt1
+        |> checkSize
+
+
+divBy : BigInt -> BigInt -> Result String BigInt
+divBy bigInt1 bigInt2 =
+    BigInt.div bigInt2 bigInt1
+        |> checkSize
+
+
+squareRoot : BigInt -> Result String BigInt
+squareRoot bigInt =
+    let
+        recursive : BigInt -> Result String BigInt
+        recursive currentBigInt =
+            let
+                check : BigInt -> Result String BigInt
+                check algorithm =
+                    if algorithm == currentBigInt then
+                        Ok algorithm
+
+                    else
+                        recursive algorithm
+            in
+            bigInt
+                |> mulBy quintillion
+                |> Result.andThen (divBy currentBigInt)
+                |> Result.andThen (addBy currentBigInt)
+                |> Result.andThen (divBy (BigInt.fromInt 2))
+                |> Result.andThen check
+    in
+    recursive bigInt

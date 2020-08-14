@@ -14,6 +14,7 @@ module Data exposing
     , addressTimeswapPool
     , allowance
     , approve
+    , balanceOf
     , borrow
     , depositOf
     , depositOfDecoder
@@ -28,10 +29,14 @@ module Data exposing
     , lend
     , loanOf
     , loanOfDecoder
+    , mint
+    , mintCollateralAmount
+    , mintTokenAmount
     , multiplyBy
     , sorter
     , squareRoot
     , subtractBy
+    , toBigInt
     , toUnsignedIntegerFromStringDecimal
     , toUnsignedIntegerFromStringHexadecimal
     , toUnsignedIntegerFromStringToken
@@ -44,6 +49,7 @@ module Data exposing
     , viewReservesDecoder
     )
 
+import BigInt exposing (BigInt)
 import Element exposing (Attribute, Element)
 import Element.Input exposing (Label, Placeholder)
 import Hexadecimal exposing (Hexadecimal)
@@ -134,9 +140,19 @@ loanOf owner index =
     Data selectorLoanOf [ AddressParameter owner, UnsignedIntegerParameter index ]
 
 
+balanceOf : Address -> Data
+balanceOf owner =
+    Data selectorBalanceOf [ AddressParameter owner ]
+
+
 allowance : Address -> Address -> Data
 allowance owner spender =
     Data selectorAllowance [ AddressParameter owner, AddressParameter spender ]
+
+
+mint : Address -> UnsignedInteger -> Data
+mint recipient amount =
+    Data selectorMint [ AddressParameter recipient, UnsignedIntegerParameter amount ]
 
 
 approve : Address -> UnsignedInteger -> Data
@@ -183,9 +199,19 @@ selectorLoanOf =
     Selector Hexadecimal.loanOf
 
 
+selectorBalanceOf : Selector
+selectorBalanceOf =
+    Selector Hexadecimal.balanceOf
+
+
 selectorAllowance : Selector
 selectorAllowance =
     Selector Hexadecimal.allowance
+
+
+selectorMint : Selector
+selectorMint =
+    Selector Hexadecimal.mint
 
 
 selectorApprove : Selector
@@ -496,6 +522,16 @@ unsignedIntegerMaxInteger =
     UnsignedInteger Hexadecimal.maxUnsignedInteger
 
 
+mintTokenAmount : UnsignedInteger
+mintTokenAmount =
+    UnsignedInteger Hexadecimal.mintTokenAmount
+
+
+mintCollateralAmount : UnsignedInteger
+mintCollateralAmount =
+    UnsignedInteger Hexadecimal.mintCollateralAmount
+
+
 
 -- UNSIGNED INTEGERS MATH
 
@@ -597,3 +633,13 @@ squareRoot (UnsignedInteger hexadecimal) =
     hexadecimal
         |> Hexadecimal.squareRoot
         |> Result.map UnsignedInteger
+
+
+
+-- BIG INT
+
+
+toBigInt : UnsignedInteger -> Result String BigInt
+toBigInt (UnsignedInteger hexadecimal) =
+    hexadecimal
+        |> Hexadecimal.toBigInt

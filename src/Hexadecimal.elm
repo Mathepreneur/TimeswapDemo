@@ -8,6 +8,7 @@ module Hexadecimal exposing
     , allowance
     , append
     , approve
+    , balanceOf
     , borrow
     , counter
     , decimalSquareRoot
@@ -26,11 +27,15 @@ module Hexadecimal exposing
     , length
     , loanOf
     , maxUnsignedInteger
+    , mint
+    , mintCollateralAmount
+    , mintTokenAmount
     , multiplyBy
     , one
     , padUpto64
     , squareRoot
     , subtractBy
+    , toBigInt
     , toInputTextDecimal
     , toInputTextHexadecimal
     , toStringToken
@@ -42,6 +47,7 @@ module Hexadecimal exposing
     , zero
     )
 
+import BigInt exposing (BigInt)
 import Element exposing (Attribute, Element)
 import Element.Input as Input exposing (Label, Placeholder)
 import Json.Decode as Decode exposing (Decoder)
@@ -108,60 +114,6 @@ encode hexadecimal =
 
 fromStringHexadecimal : String -> Result String Hexadecimal
 fromStringHexadecimal string =
-    let
-        remove0x : List Char -> Result String (List Char)
-        remove0x characters =
-            case characters of
-                [] ->
-                    Err "Cannot be empty string"
-
-                '0' :: 'x' :: remainingCharacters ->
-                    Ok remainingCharacters
-
-                '0' :: 'X' :: remainingCharacters ->
-                    Ok remainingCharacters
-
-                _ ->
-                    Err "Must start wiht 0x or 0X"
-
-        initial : List Char -> Result String Hexadecimal
-        initial initialCharacters =
-            recursive initialCharacters []
-
-        recursive : List Char -> List Digit -> Result String Hexadecimal
-        recursive characters accumulatingDigits =
-            case ( characters, accumulatingDigits ) of
-                ( [], [] ) ->
-                    Err "Cannot be empty string after 0x or 0X"
-
-                ( [], singletonDigit :: remainingDigits ) ->
-                    Ok <| create singletonDigit remainingDigits
-
-                ( singletonCharacter :: remainingCharacters, digits ) ->
-                    let
-                        resultDigit : Result String Digit
-                        resultDigit =
-                            fromCharToDigit singletonCharacter
-
-                        recursiveRemaining : List Digit -> Result String Hexadecimal
-                        recursiveRemaining =
-                            recursive remainingCharacters
-                    in
-                    digits
-                        |> Result.Ok
-                        |> Result.map2 (::) resultDigit
-                        |> Result.andThen recursiveRemaining
-    in
-    string
-        |> String.toList
-        |> remove0x
-        |> Result.map List.reverse
-        |> Result.andThen initial
-        |> Result.map remove0
-
-
-fromStringHexadecimal2 : String -> Result String Hexadecimal
-fromStringHexadecimal2 string =
     let
         remove0x : List Char -> Result String (List Char)
         remove0x characters =
@@ -677,6 +629,56 @@ one =
     create One []
 
 
+mintTokenAmount : Hexadecimal
+mintTokenAmount =
+    Hexadecimal
+        { leftMostDigit = Three
+        , otherDigits =
+            [ Six
+            , Three
+            , Five
+            , LowercaseC
+            , Nine
+            , LowercaseA
+            , LowercaseD
+            , LowercaseC
+            , Five
+            , LowercaseD
+            , LowercaseE
+            , LowercaseA
+            , Zero
+            , Zero
+            , Zero
+            , Zero
+            , Zero
+            ]
+        }
+
+
+mintCollateralAmount : Hexadecimal
+mintCollateralAmount =
+    Hexadecimal
+        { leftMostDigit = Four
+        , otherDigits =
+            [ Five
+            , Six
+            , Three
+            , Nine
+            , One
+            , Eight
+            , Two
+            , Four
+            , Four
+            , LowercaseF
+            , Four
+            , Zero
+            , Zero
+            , Zero
+            , Zero
+            ]
+        }
+
+
 tokenOne : Hexadecimal
 tokenOne =
     create LowercaseD
@@ -766,6 +768,22 @@ loanOf =
         }
 
 
+balanceOf : Hexadecimal
+balanceOf =
+    Hexadecimal
+        { leftMostDigit = Seven
+        , otherDigits =
+            [ Zero
+            , LowercaseA
+            , Zero
+            , Eight
+            , Two
+            , Three
+            , One
+            ]
+        }
+
+
 allowance : Hexadecimal
 allowance =
     Hexadecimal
@@ -778,6 +796,22 @@ allowance =
             , LowercaseD
             , Three
             , LowercaseE
+            ]
+        }
+
+
+mint : Hexadecimal
+mint =
+    Hexadecimal
+        { leftMostDigit = Four
+        , otherDigits =
+            [ Zero
+            , LowercaseC
+            , One
+            , Zero
+            , LowercaseF
+            , One
+            , Nine
             ]
         }
 
@@ -2120,3 +2154,23 @@ fromIntToDigit integer =
 
         _ ->
             Err "Not Hexadecimalable"
+
+
+
+-- BIG INT
+
+
+toBigInt : Hexadecimal -> Result String BigInt
+toBigInt hexadecimal =
+    hexadecimal
+        |> toStringHexadecimal
+        |> BigInt.fromHexString
+        |> Result.fromMaybe "Not able to turn to hexadecimal"
+
+
+fromBigInt : BigInt -> Result String Hexadecimal
+fromBigInt bigInt =
+    bigInt
+        |> BigInt.toHexString
+        |> (++) "0x"
+        |> fromStringHexadecimal
