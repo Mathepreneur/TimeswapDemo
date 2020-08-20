@@ -40,6 +40,7 @@ module Data exposing
     , toUnsignedIntegerFromStringDecimal
     , toUnsignedIntegerFromStringHexadecimal
     , toUnsignedIntegerFromStringToken
+    , totalDeposit
     , unsignedIntegerDecoder
     , unsignedIntegerInputText
     , unsignedIntegerMaxInteger
@@ -145,6 +146,11 @@ balanceOf owner =
     Data selectorBalanceOf [ AddressParameter owner ]
 
 
+totalDeposit : Data
+totalDeposit =
+    Data selectorTotalDeposit []
+
+
 allowance : Address -> Address -> Data
 allowance owner spender =
     Data selectorAllowance [ AddressParameter owner, AddressParameter spender ]
@@ -202,6 +208,11 @@ selectorLoanOf =
 selectorBalanceOf : Selector
 selectorBalanceOf =
     Selector Hexadecimal.balanceOf
+
+
+selectorTotalDeposit : Selector
+selectorTotalDeposit =
+    Selector Hexadecimal.totalDeposit
 
 
 selectorAllowance : Selector

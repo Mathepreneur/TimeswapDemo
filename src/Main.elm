@@ -1,4 +1,4 @@
-port module Main exposing (idDecoder, main)
+port module Main exposing (main)
 
 -- IMPORT
 
@@ -66,6 +66,8 @@ type alias Info =
     , collateralBalance : Maybe UnsignedInteger
     , tokenApproved : Maybe Approved
     , collateralApproved : Maybe Approved
+    , collateralPoolBalance : Maybe UnsignedInteger
+    , totalDeposit : Maybe Deposit
     , reserve : Maybe Reserve
     , transaction : Transaction
     , deposit : Maybe Deposit
@@ -108,6 +110,8 @@ type Function
     | LoanOf UnsignedInteger
     | BalanceOfToken
     | BalanceOfCollateral
+    | BalanceOfPoolCollateral
+    | TotalDeposit
     | AllowanceToken
     | AllowanceCollateral
     | MintToken
@@ -169,6 +173,7 @@ type Msg
     | SwitchToLend
     | SwitchToBorrow
     | ChangeTokenAmount String
+    | SlideCollateralAmount Float
     | ChangeCollateralAmount String
     | ChangeInterestAmount String
     | WatchToken
@@ -215,6 +220,9 @@ update msg model =
 
         ( ChangeTokenAmount input, Rinkeby info ) ->
             updateTokenAmount input info model
+
+        ( SlideCollateralAmount input, Rinkeby info ) ->
+            updateSliderAmount input info model
 
         ( ChangeCollateralAmount input, Rinkeby info ) ->
             updateCollateralAmount input info model
@@ -279,9 +287,17 @@ updateConnect value model =
                         balanceOfCollateralOutcome =
                             balanceOfCollateral address balanceOfTokenOutcome.log
 
+                        balanceOfCollateralPoolOutcome : Outcome
+                        balanceOfCollateralPoolOutcome =
+                            balanceOfPoolCollateral balanceOfCollateralOutcome.log
+
+                        totalDepositOutcome : Outcome
+                        totalDepositOutcome =
+                            totalDeposit balanceOfCollateralPoolOutcome.log
+
                         allowanceTokenOutcome : Outcome
                         allowanceTokenOutcome =
-                            allowanceToken address balanceOfCollateralOutcome.log
+                            allowanceToken address totalDepositOutcome.log
 
                         allowanceCollateralOutcome : Outcome
                         allowanceCollateralOutcome =
@@ -295,6 +311,8 @@ updateConnect value model =
                                 , sendTransaction loanOfOutcome.value
                                 , sendTransaction balanceOfTokenOutcome.value
                                 , sendTransaction balanceOfCollateralOutcome.value
+                                , sendTransaction balanceOfCollateralPoolOutcome.value
+                                , sendTransaction totalDepositOutcome.value
                                 , sendTransaction allowanceTokenOutcome.value
                                 , sendTransaction allowanceCollateralOutcome.value
                                 ]
@@ -325,6 +343,8 @@ initialState address log =
         , collateralBalance = Nothing
         , tokenApproved = Nothing
         , collateralApproved = Nothing
+        , collateralPoolBalance = Nothing
+        , totalDeposit = Nothing
         , reserve = Nothing
         , transaction = defaultLend
         , deposit = Nothing
@@ -620,9 +640,49 @@ updateTransaction value info model =
                     let
                         nextInfo : Info
                         nextInfo =
-                            { info | tokenBalance = Nothing }
+                            { info | collateralBalance = Nothing }
                     in
                     ( { model | state = Rinkeby nextInfo }, Cmd.none )
+
+        ( Ok "2.0", Ok (Just BalanceOfPoolCollateral) ) ->
+            let
+                resultUnsignedInteger : Result String UnsignedInteger
+                resultUnsignedInteger =
+                    value
+                        |> Decode.decodeValue unsignedIntegerDecoder
+                        |> Result.withDefault (Err "Cannot turn to big int")
+            in
+            case resultUnsignedInteger of
+                Ok unsignedInteger ->
+                    let
+                        nextInfo : Info
+                        nextInfo =
+                            { info | collateralPoolBalance = Just unsignedInteger }
+                    in
+                    ( { model | state = Rinkeby nextInfo }, Cmd.none )
+
+                _ ->
+                    let
+                        nextInfo : Info
+                        nextInfo =
+                            { info | collateralBalance = Nothing }
+                    in
+                    ( { model | state = Rinkeby nextInfo }, Cmd.none )
+
+        ( Ok "2.0", Ok (Just TotalDeposit) ) ->
+            let
+                deposit : Maybe Deposit
+                deposit =
+                    value
+                        |> Decode.decodeValue depositOfDecoder
+                        |> Result.map Result.toMaybe
+                        |> Result.withDefault Nothing
+
+                nextInfo : Info
+                nextInfo =
+                    { info | totalDeposit = deposit }
+            in
+            ( { model | state = Rinkeby nextInfo }, Cmd.none )
 
         ( Ok "2.0", Ok (Just AllowanceToken) ) ->
             let
@@ -846,6 +906,81 @@ updateTokenAmount input info model =
             ( model, Cmd.none )
 
 
+updateSliderAmount : Float -> Info -> Model -> ( Model, Cmd Msg )
+updateSliderAmount input info model =
+    let
+        initialTransaction : Transaction
+        initialTransaction =
+            info.transaction
+
+        resultToken : Result String BigInt
+        resultToken =
+            fromTokenToBigInt initialTransaction.token
+
+        maxCollateral : Result String BigInt
+        maxCollateral =
+            info.reserve
+                |> Result.fromMaybe "No Maybe"
+                |> Utility.andThen2 getCollateralMax resultToken
+
+        resultCollateral : Result String BigInt
+        resultCollateral =
+            if input < 0 then
+                Err "Cannot be less than zero"
+
+            else if input > 100 then
+                Err "Cannot be greater than one hundred"
+
+            else
+                input
+                    |> String.fromFloat
+                    |> fromTokenToBigInt
+                    |> Utility.andThen2 mulBy maxCollateral
+                    |> Utility.andThen2 divBy (mulBy (BigInt.fromInt 100) quintillion)
+    in
+    case info.reserve of
+        Just reserve ->
+            case ( initialTransaction.transactionType, resultToken, resultCollateral ) of
+                ( Lend, Ok token, Ok collateral ) ->
+                    let
+                        transaction : Transaction
+                        transaction =
+                            { initialTransaction | collateral = roundDownString <| Result.withDefault "" <| fromBigIntToToken collateral, interest = getInterestLend token collateral reserve }
+
+                        nextInfo : Info
+                        nextInfo =
+                            { info | transaction = transaction }
+                    in
+                    ( { model | state = Rinkeby nextInfo }, Cmd.none )
+
+                ( Borrow, Ok token, Ok collateral ) ->
+                    let
+                        transaction : Transaction
+                        transaction =
+                            { initialTransaction | collateral = roundDownString <| Result.withDefault "" <| fromBigIntToToken collateral, interest = getInterestBorrow token collateral reserve }
+
+                        nextInfo : Info
+                        nextInfo =
+                            { info | transaction = transaction }
+                    in
+                    ( { model | state = Rinkeby nextInfo }, Cmd.none )
+
+                _ ->
+                    let
+                        transaction : Transaction
+                        transaction =
+                            { initialTransaction | collateral = "" }
+
+                        nextInfo : Info
+                        nextInfo =
+                            { info | transaction = transaction }
+                    in
+                    ( { model | state = Rinkeby nextInfo }, Cmd.none )
+
+        Nothing ->
+            ( model, Cmd.none )
+
+
 updateCollateralAmount : String -> Info -> Model -> ( Model, Cmd Msg )
 updateCollateralAmount input info model =
     let
@@ -906,60 +1041,7 @@ updateCollateralAmount input info model =
 
 updateInterestAmount : String -> Info -> Model -> ( Model, Cmd Msg )
 updateInterestAmount input info model =
-    let
-        initialTransaction : Transaction
-        initialTransaction =
-            info.transaction
-
-        resultCollateral : Result String BigInt
-        resultCollateral =
-            fromTokenToBigInt initialTransaction.collateral
-
-        resultInterest : Result String BigInt
-        resultInterest =
-            fromTokenToBigInt input
-    in
-    case info.reserve of
-        Just reserve ->
-            case ( initialTransaction.transactionType, resultCollateral, resultInterest ) of
-                ( Lend, Ok collateral, Ok interest ) ->
-                    let
-                        transaction : Transaction
-                        transaction =
-                            { initialTransaction | token = getTokenLend collateral interest reserve, interest = input }
-
-                        nextInfo : Info
-                        nextInfo =
-                            { info | transaction = transaction }
-                    in
-                    ( { model | state = Rinkeby nextInfo }, Cmd.none )
-
-                ( Borrow, Ok collateral, Ok interest ) ->
-                    let
-                        transaction : Transaction
-                        transaction =
-                            { initialTransaction | token = getTokenBorrow collateral interest reserve, interest = input }
-
-                        nextInfo : Info
-                        nextInfo =
-                            { info | transaction = transaction }
-                    in
-                    ( { model | state = Rinkeby nextInfo }, Cmd.none )
-
-                _ ->
-                    let
-                        transaction : Transaction
-                        transaction =
-                            { initialTransaction | interest = input }
-
-                        nextInfo : Info
-                        nextInfo =
-                            { info | transaction = transaction }
-                    in
-                    ( { model | state = Rinkeby nextInfo }, Cmd.none )
-
-        Nothing ->
-            ( model, Cmd.none )
+    ( model, Cmd.none )
 
 
 updateMintToken : Info -> Model -> ( Model, Cmd Msg )
@@ -1475,6 +1557,56 @@ balanceOfCollateral owner log =
         nextLog : Log
         nextLog =
             next BalanceOfCollateral log
+
+        value : Value
+        value =
+            Encode.object
+                [ ( "id", idEncode nextLog )
+                , ( "jsonrpc", jsonrpcEncode )
+                , ( "method", methodEncode Call )
+                , ( "params", parameterEncode parameter )
+                ]
+    in
+    Outcome value nextLog
+
+
+balanceOfPoolCollateral : Log -> Outcome
+balanceOfPoolCollateral log =
+    let
+        parameter : List ( String, Value )
+        parameter =
+            [ ( "to", Data.addressEncode Data.addressFileTSDemo )
+            , ( "data", Data.encode <| Data.balanceOf Data.addressTimeswapPool )
+            ]
+
+        nextLog : Log
+        nextLog =
+            next BalanceOfPoolCollateral log
+
+        value : Value
+        value =
+            Encode.object
+                [ ( "id", idEncode nextLog )
+                , ( "jsonrpc", jsonrpcEncode )
+                , ( "method", methodEncode Call )
+                , ( "params", parameterEncode parameter )
+                ]
+    in
+    Outcome value nextLog
+
+
+totalDeposit : Log -> Outcome
+totalDeposit log =
+    let
+        parameter : List ( String, Value )
+        parameter =
+            [ ( "to", Data.addressEncode Data.addressTimeswapPool )
+            , ( "data", Data.encode Data.totalDeposit )
+            ]
+
+        nextLog : Log
+        nextLog =
+            next TotalDeposit log
 
         value : Value
         value =
@@ -2026,7 +2158,6 @@ viewWatchCollateral =
         }
 
 
-
 viewEmail : Element Msg
 viewEmail =
     Element.el
@@ -2049,7 +2180,7 @@ viewBody info =
         , Element.paddingXY 20 172
         , Element.spacing 20
         ]
-        [ viewAssetBox info.deposit
+        [ viewAssetBox info.deposit info.collateralPoolBalance info.totalDeposit
         , viewSwap info
         , viewLiabilityBox info.loan
         ]
@@ -2098,7 +2229,7 @@ viewSwap info =
                 ]
                 [ viewLendTabs
                 , viewToken info.transaction.token
-                , viewInsurance info.transaction.token info.transaction.collateral info.reserve
+                , viewInsurance info.transaction.token info.transaction.collateral info.reserve info.collateralPoolBalance info.totalDeposit
                 , viewInterest info.transaction.token info.transaction.interest
                 , viewApproveButton info.tokenApproved
                 , viewSwapButton info.tokenBalance info.collateralBalance info.tokenApproved info.transaction
@@ -2217,8 +2348,8 @@ viewToken token =
         ]
 
 
-viewInsurance : String -> String -> Maybe Reserve -> Element Msg
-viewInsurance token collateral maybeReserve =
+viewInsurance2 : String -> String -> Maybe Reserve -> Maybe UnsignedInteger -> Maybe Deposit -> Element Msg
+viewInsurance2 token collateral maybeReserve maybeCollateralPoolBalance maybeTotalDeposit =
     Element.column
         [ Element.width Element.fill
         , Element.padding 20
@@ -2227,8 +2358,65 @@ viewInsurance token collateral maybeReserve =
         , Border.rounded 30
         ]
         [ viewInputInsuranceDetails <| getInsuranceDetails token maybeReserve
-        , viewInput collateral "FILE" ChangeCollateralAmount
+        , viewInput collateral "" ChangeCollateralAmount
+        , viewClaim collateral maybeCollateralPoolBalance maybeTotalDeposit
         ]
+
+
+viewInsurance : String -> String -> Maybe Reserve -> Maybe UnsignedInteger -> Maybe Deposit -> Element Msg
+viewInsurance token collateral maybeReserve maybeCollateralPoolBalance maybeTotalDeposit =
+    Element.column
+        [ Element.width Element.fill
+        , Element.padding 20
+        , Element.spacing 10
+        , Background.color imperfectWhite
+        , Border.rounded 30
+        ]
+        [ viewInputInsuranceDetails <| getInsuranceDetails token maybeReserve
+        , viewSlider collateral <| getInsuranceDetails token maybeReserve
+        , viewInput collateral "" ChangeCollateralAmount
+        , viewClaim collateral maybeCollateralPoolBalance maybeTotalDeposit
+        ]
+
+
+viewClaim : String -> Maybe UnsignedInteger -> Maybe Deposit -> Element Msg
+viewClaim collateral maybeCollateralPoolBalance maybeTotalDeposit =
+    let
+        resultCollateral : Result String BigInt
+        resultCollateral =
+            collateral
+                |> fromTokenToBigInt
+
+        resultCollateralPoolBalance : Result String BigInt
+        resultCollateralPoolBalance =
+            maybeCollateralPoolBalance
+                |> Result.fromMaybe "Empty"
+                |> Result.andThen Data.toBigInt
+
+        resultTotalInsurance : Result String BigInt
+        resultTotalInsurance =
+            maybeTotalDeposit
+                |> Result.fromMaybe "Empty"
+                |> Result.map .insurance
+                |> Result.andThen Data.toBigInt
+
+        maxClaim : String
+        maxClaim =
+            resultCollateral
+                |> Utility.andThen2 mulBy resultCollateralPoolBalance
+                |> Utility.andThen2 divBy resultTotalInsurance
+                |> Result.andThen fromBigIntToToken
+                |> Result.map roundDownString
+                |> Result.withDefault "0.0"
+    in
+    Element.el
+        [ Element.padding 5
+        , Border.rounded 30
+        , Font.color gray
+        , Font.size 14
+        , Font.family lato
+        ]
+        (Element.text <| "Current Max Claim of " ++ maxClaim ++ " FILE")
 
 
 viewCollateral : String -> String -> Maybe Reserve -> Element Msg
@@ -2251,6 +2439,7 @@ getInsuranceDetails token maybeReserve =
         |> Result.fromMaybe "No reserves"
         |> Utility.andThen2 getCollateralMax (fromTokenToBigInt token)
         |> Result.andThen fromBigIntToToken
+        |> Result.map roundDownString
         |> Result.toMaybe
 
 
@@ -2260,6 +2449,7 @@ getCollateralDetails token maybeReserve =
         |> Result.fromMaybe "No reserve"
         |> Utility.andThen2 getCollateralMin (fromTokenToBigInt token)
         |> Result.andThen fromBigIntToToken
+        |> Result.map roundDownString
         |> Result.toMaybe
 
 
@@ -2272,6 +2462,25 @@ unsignedIntegerToString resultCollateral =
 
 viewInterest : String -> String -> Element Msg
 viewInterest token interest =
+    let
+        resultToken : Result String BigInt
+        resultToken =
+            token
+                |> fromTokenToBigInt
+
+        resultInterest : Result String BigInt
+        resultInterest =
+            interest
+                |> fromTokenToBigInt
+
+        output : String
+        output =
+            resultInterest
+                |> Utility.andThen2 addBy resultToken
+                |> Result.andThen fromBigIntToToken
+                |> Result.map roundDownString
+                |> Result.withDefault ""
+    in
     Element.column
         [ Element.width Element.fill
         , Element.padding 20
@@ -2280,7 +2489,7 @@ viewInterest token interest =
         , Border.rounded 30
         ]
         [ viewInputInterestDetails <| getAPR token interest
-        , viewInput interest "DAI" ChangeInterestAmount
+        , viewInput output "DAI" ChangeInterestAmount
         ]
 
 
@@ -2316,6 +2525,63 @@ viewInputInsuranceDetails maybeLimit =
         [ viewInsuranceText
         , viewMaximumInsurance maybeLimit
         ]
+
+
+viewSlider : String -> Maybe String -> Element Msg
+viewSlider collateral maybeLimit =
+    let
+        value : Float
+        value =
+            case maybeLimit of
+                Just string ->
+                    collateral
+                        |> fromTokenToBigInt
+                        |> Utility.andThen2 mulBy (mulBy (BigInt.fromInt 100) quintillion)
+                        |> Utility.andThen2 divBy (fromTokenToBigInt string)
+                        |> Result.andThen fromBigIntToToken
+                        |> Result.map (String.split ".")
+                        |> Result.toMaybe
+                        |> Maybe.andThen List.head
+                        |> Maybe.andThen String.toFloat
+                        |> Maybe.withDefault 50
+
+                Nothing ->
+                    50
+    in
+    Input.slider
+        [ Element.width Element.fill ]
+        { onChange = SlideCollateralAmount
+        , label = Input.labelHidden "Slider"
+        , min = 0
+        , max = 100
+        , value = value
+        , thumb = thumb value
+        , step = Just 1
+        }
+
+
+thumb : Float -> Input.Thumb
+thumb float =
+    Input.thumb
+        [ Element.width <| Element.px 40
+        , Element.height <| Element.px 20
+        , Element.inFront <| viewThumbPercent float
+        , Border.rounded 20
+        , Background.color blue
+        ]
+
+
+viewThumbPercent : Float -> Element Never
+viewThumbPercent float =
+    Element.el
+        [ Element.centerX
+        , Element.centerY
+        , Font.color imperfectWhite
+        , Font.size 12
+        , Font.family lato
+        ]
+    <|
+        Element.text (String.fromFloat float ++ "%")
 
 
 viewInputCollateralDetails : Maybe String -> Element Msg
@@ -2381,7 +2647,7 @@ viewInterestText =
         , Font.size 14
         , Font.family lato
         ]
-        (Element.text "Interest on August 5, 2021")
+        (Element.text "Output on August 5, 2021")
 
 
 viewMaximumInsurance : Maybe String -> Element Msg
@@ -2396,7 +2662,7 @@ viewMaximumInsurance maybeLimit =
                 , Font.size 14
                 , Font.family lato
                 ]
-                (Element.text <| "Maximum " ++ limit)
+                (Element.text <| "Max " ++ limit)
 
         Nothing ->
             Element.none
@@ -2414,7 +2680,7 @@ viewMinimumCollateral maybeLimit =
                 , Font.size 14
                 , Font.family lato
                 ]
-                (Element.text <| "Minimum " ++ limit)
+                (Element.text <| "Min " ++ limit)
 
         Nothing ->
             Element.none
@@ -2436,15 +2702,6 @@ viewPercent maybePercent =
 
         Nothing ->
             Element.none
-
-
-viewArrow : Element Msg
-viewArrow =
-    Image.toElement
-        [ Element.width <| Element.px 10
-        , Element.height Element.shrink
-        ]
-        Image.chevronDown
 
 
 viewInput : String -> String -> (String -> Msg) -> Element Msg
@@ -2502,15 +2759,14 @@ viewTokenInput string =
 
 viewCurrency : String -> Element Msg
 viewCurrency currency =
-    Element.row
+    Element.el
         [ Element.spacing 5
         , Font.color imperfectBlack
         , Font.size 24
         , Font.family lato
         ]
-        [ Element.text currency
-        , viewArrow
-        ]
+    <|
+        Element.text currency
 
 
 viewApproveButton : Maybe Approved -> Element Msg
@@ -2714,23 +2970,20 @@ viewSwapButton tokenBalance collateralBalance approved transaction =
 -- VIEW ASSET
 
 
-viewAssetBox : Maybe Deposit -> Element Msg
-viewAssetBox maybeDeposit =
+viewAssetBox : Maybe Deposit -> Maybe UnsignedInteger -> Maybe Deposit -> Element Msg
+viewAssetBox maybeDeposit maybeCollateralBalance maybeTotalDeposit =
     Element.el
         [ Element.width Element.fill
         , Element.height Element.fill
         ]
     <|
-        viewAsset maybeDeposit
+        viewAsset maybeDeposit maybeCollateralBalance maybeTotalDeposit
 
 
-viewAsset : Maybe Deposit -> Element Msg
-viewAsset maybeDeposit =
-    case maybeDeposit of
-        Nothing ->
-            Element.none
-
-        Just deposit ->
+viewAsset : Maybe Deposit -> Maybe UnsignedInteger -> Maybe Deposit -> Element Msg
+viewAsset maybeDeposit maybeCollateralBalance maybeTotalDeposit =
+    case ( maybeDeposit, maybeCollateralBalance, maybeTotalDeposit ) of
+        ( Just deposit, Just collateralBalance, Just totalPoolDeposit ) ->
             if deposit.deposit == Data.unsignedIntegerZero && deposit.insurance == Data.unsignedIntegerZero then
                 Element.none
 
@@ -2747,8 +3000,11 @@ viewAsset maybeDeposit =
                     , Element.scrollbarX
                     ]
                     [ viewDepositTitle
-                    , viewDepositBox deposit
+                    , viewDepositBox deposit collateralBalance totalPoolDeposit
                     ]
+
+        _ ->
+            Element.none
 
 
 viewDepositTitle : Element Msg
@@ -2771,7 +3027,7 @@ viewDepositText =
         , Font.family lato
         , Font.center
         ]
-        (Element.text "Deposit")
+        (Element.text "Asset")
 
 
 viewDepositMaturity : Element Msg
@@ -2786,8 +3042,8 @@ viewDepositMaturity =
         (Element.text "August 5, 2021")
 
 
-viewDepositBox : Deposit -> Element Msg
-viewDepositBox { deposit, insurance } =
+viewDepositBox : Deposit -> UnsignedInteger -> Deposit -> Element Msg
+viewDepositBox { deposit, insurance } collateralBalance totalPoolDeposit =
     Element.column
         [ Element.width Element.fill
         , Element.padding 20
@@ -2796,15 +3052,42 @@ viewDepositBox { deposit, insurance } =
         , Border.rounded 30
         ]
         [ viewDeposit deposit
-        , viewDepositInsurance insurance
+        , viewDepositInsurance insurance collateralBalance totalPoolDeposit.insurance
         ]
 
 
 viewDeposit : UnsignedInteger -> Element Msg
 viewDeposit deposit =
-    Element.row
+    Element.column
         [ Element.width Element.fill
         , Element.padding 5
+        , Element.spacing 10
+        , Font.color imperfectBlack
+        , Font.size 24
+        , Font.family lato
+        ]
+        [ viewDepositInformation
+        , viewDepositAmount deposit
+        ]
+
+
+viewDepositInformation : Element Msg
+viewDepositInformation =
+    Element.el
+        [ Element.width Element.fill
+        , Element.spacing 10
+        , Font.color gray
+        , Font.size 12
+        , Font.family lato
+        ]
+    <|
+        Element.text "Max Return"
+
+
+viewDepositAmount : UnsignedInteger -> Element Msg
+viewDepositAmount deposit =
+    Element.row
+        [ Element.width Element.fill
         , Element.spacing 10
         , Font.color imperfectBlack
         , Font.size 24
@@ -2815,9 +3098,9 @@ viewDeposit deposit =
         ]
 
 
-viewDepositInsurance : UnsignedInteger -> Element Msg
-viewDepositInsurance insurance =
-    Element.row
+viewDepositInsurance : UnsignedInteger -> UnsignedInteger -> UnsignedInteger -> Element Msg
+viewDepositInsurance insurance collateralBalance totalPoolInsurance =
+    Element.column
         [ Element.width Element.fill
         , Element.padding 5
         , Element.spacing 10
@@ -2825,7 +3108,59 @@ viewDepositInsurance insurance =
         , Font.size 24
         , Font.family lato
         ]
-        [ Element.text <| Maybe.withDefault "" <| unsignedIntegerToString <| Ok insurance
+        [ viewDepositInsuranceAmount insurance
+        , viewDepositClaimAmount insurance collateralBalance totalPoolInsurance
+        ]
+
+
+viewDepositInsuranceAmount : UnsignedInteger -> Element Msg
+viewDepositInsuranceAmount insurance =
+    Element.el
+        [ Element.width Element.fill
+        , Element.spacing 10
+        , Font.color gray
+        , Font.size 12
+        , Font.family lato
+        ]
+    <|
+        (Element.text <| "Current Max Claim with " ++ (Maybe.withDefault "" <| unsignedIntegerToString <| Ok insurance) ++ " Insurance")
+
+
+viewDepositClaimAmount : UnsignedInteger -> UnsignedInteger -> UnsignedInteger -> Element Msg
+viewDepositClaimAmount insurance collateralBalance totalPoolInsurance =
+    let
+        resultInsurance : Result String BigInt
+        resultInsurance =
+            insurance
+                |> Data.toBigInt
+
+        resultCollateralBalance : Result String BigInt
+        resultCollateralBalance =
+            collateralBalance
+                |> Data.toBigInt
+
+        resultTotalPoolInsurance : Result String BigInt
+        resultTotalPoolInsurance =
+            totalPoolInsurance
+                |> Data.toBigInt
+
+        maximumClaim : String
+        maximumClaim =
+            resultInsurance
+                |> Utility.andThen2 mulBy resultCollateralBalance
+                |> Utility.andThen2 divBy resultTotalPoolInsurance
+                |> Result.andThen fromBigIntToToken
+                |> Result.map roundDownString
+                |> Result.withDefault ""
+    in
+    Element.row
+        [ Element.width Element.fill
+        , Element.spacing 10
+        , Font.color imperfectBlack
+        , Font.size 24
+        , Font.family lato
+        ]
+        [ Element.text maximumClaim
         , Element.el [ Element.alignRight ] <| Element.text "FILE"
         ]
 
@@ -2915,9 +3250,35 @@ viewLoanBox { loan, collateral } =
 
 viewLoan : UnsignedInteger -> Element Msg
 viewLoan loan =
-    Element.row
+    Element.column
         [ Element.width Element.fill
         , Element.padding 5
+        , Element.spacing 10
+        , Font.color imperfectBlack
+        , Font.size 24
+        , Font.family lato
+        ]
+        [ viewLoanDebtDetails
+        , viewLoanAmount loan
+        ]
+
+
+viewLoanDebtDetails : Element Msg
+viewLoanDebtDetails =
+    Element.el
+        [ Element.width Element.fill
+        , Font.color gray
+        , Font.size 12
+        , Font.family lato
+        ]
+    <|
+        Element.text "Debt"
+
+
+viewLoanAmount : UnsignedInteger -> Element Msg
+viewLoanAmount loan =
+    Element.row
+        [ Element.width Element.fill
         , Element.spacing 10
         , Font.color imperfectBlack
         , Font.size 24
@@ -2930,9 +3291,35 @@ viewLoan loan =
 
 viewLoanCollateral : UnsignedInteger -> Element Msg
 viewLoanCollateral collateral =
-    Element.row
+    Element.column
         [ Element.width Element.fill
         , Element.padding 5
+        , Element.spacing 10
+        , Font.color imperfectBlack
+        , Font.size 24
+        , Font.family lato
+        ]
+        [ viewLoanCollateralDetails
+        , viewLoanCollateralAmount collateral
+        ]
+
+
+viewLoanCollateralDetails : Element Msg
+viewLoanCollateralDetails =
+    Element.el
+        [ Element.width Element.fill
+        , Font.color gray
+        , Font.size 12
+        , Font.family lato
+        ]
+    <|
+        Element.text "Collateral Stake"
+
+
+viewLoanCollateralAmount : UnsignedInteger -> Element Msg
+viewLoanCollateralAmount collateral =
+    Element.row
+        [ Element.width Element.fill
         , Element.spacing 10
         , Font.color imperfectBlack
         , Font.size 24
@@ -3198,3 +3585,9 @@ squareRoot bigInt =
                 |> Result.andThen check
     in
     recursive bigInt
+
+
+roundDownString : String -> String
+roundDownString string =
+    string
+        |> String.dropRight 12

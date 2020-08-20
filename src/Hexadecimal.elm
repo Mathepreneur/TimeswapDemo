@@ -43,6 +43,7 @@ module Hexadecimal exposing
     , toTextHexadecimal
     , toTextHexadecimalShort
     , tokenOne
+    , totalDeposit
     , viewReserves
     , zero
     )
@@ -780,6 +781,22 @@ balanceOf =
             , Two
             , Three
             , One
+            ]
+        }
+
+
+totalDeposit : Hexadecimal
+totalDeposit =
+    Hexadecimal
+        { leftMostDigit = LowercaseF
+        , otherDigits =
+            [ Six
+            , One
+            , Five
+            , Three
+            , LowercaseC
+            , LowercaseC
+            , LowercaseD
             ]
         }
 
