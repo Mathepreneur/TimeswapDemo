@@ -19387,7 +19387,7 @@ var $author$project$Main$viewInsurance = F5(
 					$author$project$Main$viewSlider,
 					collateral,
 					A2($author$project$Main$getInsuranceDetails, token, maybeReserve)),
-					A3($author$project$Main$viewInput, collateral, '', $author$project$Main$ChangeCollateralAmount),
+					A3($author$project$Main$viewInput, collateral, 'INSURANCE', $author$project$Main$ChangeCollateralAmount),
 					A3($author$project$Main$viewClaim, collateral, maybeCollateralPoolBalance, maybeTotalDeposit)
 				]));
 	});

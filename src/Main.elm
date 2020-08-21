@@ -2375,7 +2375,7 @@ viewInsurance token collateral maybeReserve maybeCollateralPoolBalance maybeTota
         ]
         [ viewInputInsuranceDetails <| getInsuranceDetails token maybeReserve
         , viewSlider collateral <| getInsuranceDetails token maybeReserve
-        , viewInput collateral "" ChangeCollateralAmount
+        , viewInput collateral "INSURANCE" ChangeCollateralAmount
         , viewClaim collateral maybeCollateralPoolBalance maybeTotalDeposit
         ]
 
