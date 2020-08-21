@@ -933,7 +933,8 @@ updateSliderAmount input info model =
 
             else
                 input
-                    |> String.fromFloat
+                    |> truncate
+                    |> String.fromInt
                     |> fromTokenToBigInt
                     |> Utility.andThen2 mulBy maxCollateral
                     |> Utility.andThen2 divBy (mulBy (BigInt.fromInt 100) quintillion)
@@ -945,7 +946,7 @@ updateSliderAmount input info model =
                     let
                         transaction : Transaction
                         transaction =
-                            { initialTransaction | collateral = roundDownString <| Result.withDefault "" <| fromBigIntToToken collateral, interest = getInterestLend token collateral reserve }
+                            { initialTransaction | collateral = roundDownString <| Result.withDefault "0" <| fromBigIntToToken collateral, interest = getInterestLend token collateral reserve }
 
                         nextInfo : Info
                         nextInfo =
@@ -957,7 +958,7 @@ updateSliderAmount input info model =
                     let
                         transaction : Transaction
                         transaction =
-                            { initialTransaction | collateral = roundDownString <| Result.withDefault "" <| fromBigIntToToken collateral, interest = getInterestBorrow token collateral reserve }
+                            { initialTransaction | collateral = roundDownString <| Result.withDefault "0" <| fromBigIntToToken collateral, interest = getInterestBorrow token collateral reserve }
 
                         nextInfo : Info
                         nextInfo =
@@ -2429,6 +2430,8 @@ viewCollateral token collateral maybeReserve =
         , Border.rounded 30
         ]
         [ viewInputCollateralDetails <| getCollateralDetails token maybeReserve
+
+        --, viewSliderCollateral collateral <| getCollateralDetails token maybeReserve
         , viewInput collateral "FILE" ChangeCollateralAmount
         ]
 
@@ -2539,40 +2542,114 @@ viewSlider collateral maybeLimit =
                         |> Utility.andThen2 mulBy (mulBy (BigInt.fromInt 100) quintillion)
                         |> Utility.andThen2 divBy (fromTokenToBigInt string)
                         |> Result.andThen fromBigIntToToken
-                        |> Result.map (String.split ".")
                         |> Result.toMaybe
-                        |> Maybe.andThen List.head
                         |> Maybe.andThen String.toFloat
-                        |> Maybe.withDefault 50
+                        |> Maybe.map truncate
+                        |> Maybe.map toFloat
+                        |> Maybe.withDefault 0
 
                 Nothing ->
-                    50
+                    0
+
+        showThumb : String
+        showThumb =
+            if value < 0 || value > 100 then
+                ""
+
+            else
+                String.fromInt (truncate value) ++ "%"
     in
     Input.slider
-        [ Element.width Element.fill ]
+        [ Element.width Element.fill
+        , Element.behindContent viewTrail
+        ]
         { onChange = SlideCollateralAmount
         , label = Input.labelHidden "Slider"
         , min = 0
         , max = 100
         , value = value
-        , thumb = thumb value
+        , thumb = thumb showThumb
         , step = Just 1
         }
 
 
-thumb : Float -> Input.Thumb
-thumb float =
+viewSliderCollateral : String -> Maybe String -> Element Msg
+viewSliderCollateral collateral maybeLimit =
+    let
+        value : Float
+        value =
+            case maybeLimit of
+                Just string ->
+                    let
+                        insideValue : Result String BigInt
+                        insideValue =
+                            collateral
+                                |> fromTokenToBigInt
+                                |> Utility.andThen2 mulBy (mulBy (BigInt.fromInt 100) quintillion)
+                                |> Utility.andThen2 divBy (fromTokenToBigInt string)
+                    in
+                    quintillion
+                        |> mulBy (BigInt.fromInt 100)
+                        |> Utility.andThen2 subBy insideValue
+                        |> Result.andThen fromBigIntToToken
+                        |> Result.toMaybe
+                        |> Maybe.andThen String.toFloat
+                        |> Maybe.map truncate
+                        |> Maybe.map toFloat
+                        |> Maybe.withDefault 0
+
+                Nothing ->
+                    0
+
+        showThumb : String
+        showThumb =
+            if value < 0 || value > 100 then
+                ""
+
+            else
+                String.fromInt (truncate value) ++ "%"
+    in
+    Input.slider
+        [ Element.width Element.fill
+        , Element.behindContent viewTrail
+        ]
+        { onChange = SlideCollateralAmount
+        , label = Input.labelHidden "Slider"
+        , min = 0
+        , max = 100
+        , value = value
+        , thumb = thumb showThumb
+        , step = Just 1
+        }
+
+
+viewTrail : Element Msg
+viewTrail =
+    Element.el
+        [ Element.width Element.fill
+        , Element.height <| Element.px 10
+        , Element.paddingXY 20 0
+        , Element.centerX
+        , Element.centerY
+        , Border.rounded 10
+        , Background.color dirtyWhite
+        ]
+        Element.none
+
+
+thumb : String -> Input.Thumb
+thumb string =
     Input.thumb
         [ Element.width <| Element.px 40
         , Element.height <| Element.px 20
-        , Element.inFront <| viewThumbPercent float
+        , Element.inFront <| viewThumbPercent string
         , Border.rounded 20
         , Background.color blue
         ]
 
 
-viewThumbPercent : Float -> Element Never
-viewThumbPercent float =
+viewThumbPercent : String -> Element Never
+viewThumbPercent string =
     Element.el
         [ Element.centerX
         , Element.centerY
@@ -2581,7 +2658,7 @@ viewThumbPercent float =
         , Font.family lato
         ]
     <|
-        Element.text (String.fromFloat float ++ "%")
+        Element.text string
 
 
 viewInputCollateralDetails : Maybe String -> Element Msg
@@ -3589,5 +3666,9 @@ squareRoot bigInt =
 
 roundDownString : String -> String
 roundDownString string =
-    string
-        |> String.dropRight 12
+    if string == "0" then
+        "0"
+
+    else
+        string
+            |> String.dropRight 12
